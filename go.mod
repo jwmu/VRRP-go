@@ -1,4 +1,4 @@
-module vrrp-go
+module github.com/jwmu/VRRP-go
 
 go 1.21.0
 
