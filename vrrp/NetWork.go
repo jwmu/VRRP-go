@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
-	"vrrp-go/logger"
+	"github.com/jwmu/VRRP-go/logger"
 
 	"github.com/mdlayher/arp"
 	"github.com/mdlayher/ndp"

@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"net"
 	"time"
-	"vrrp-go/logger"
+	"github.com/jwmu/VRRP-go/logger"
 )
 
 type VirtualRouter struct {

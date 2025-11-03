@@ -4,7 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"time"
-	VRRP "vrrp-go/vrrp"
+	VRRP "github.com/jwmu/VRRP-go/vrrp"
 )
 
 var (
