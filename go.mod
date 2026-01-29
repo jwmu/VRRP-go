@@ -5,6 +5,8 @@ go 1.22
 require github.com/mdlayher/arp v0.0.0-20220512170110-6706a2966875
 
 require (
+	github.com/vishvananda/netlink v1.3.1 // indirect
+	github.com/vishvananda/netns v0.0.5 // indirect
 	golang.org/x/net v0.14.0 // indirect
 	golang.org/x/sync v0.3.0 // indirect
 	golang.org/x/sys v0.11.0 // indirect

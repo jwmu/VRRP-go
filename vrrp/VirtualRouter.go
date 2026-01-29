@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"time"
+
 	"github.com/jwmu/VRRP-go/logger"
 )
 
@@ -19,10 +20,13 @@ type VirtualRouter struct {
 	virtualRouterMACAddressIPv4   net.HardwareAddr
 	virtualRouterMACAddressIPv6   net.HardwareAddr
 	//
+	unicastMode  bool
+	unicastPeers []net.IP // Unicast peer addresses for RFC 5798 unicast mode
+	//
 	netInterface        *net.Interface
 	ipvX                byte
 	preferredSourceIP   net.IP
-	protectedIPaddrs    map[[16]byte]bool
+	protectedIPaddrs    map[[16]byte]*net.Interface
 	state               int
 	iplayerInterface    IPConnection
 	ipAddrAnnouncer     AddrAnnouncer
@@ -40,8 +44,12 @@ func NewVirtualRouter(VRID byte, nif string, Owner bool, IPvX byte) *VirtualRout
 	}
 	var vr = &VirtualRouter{}
 	vr.vrID = VRID
-	vr.virtualRouterMACAddressIPv4, _ = net.ParseMAC(fmt.Sprintf("00-00-5E-00-01-%X", VRID))
-	vr.virtualRouterMACAddressIPv6, _ = net.ParseMAC(fmt.Sprintf("00-00-5E-00-02-%X", VRID))
+	// RFC 5798 / RFC 3768: Virtual MAC address format
+	// IPv4: 00-00-5E-00-01-{VRID}
+	// IPv6: 00-00-5E-00-02-{VRID}
+	// The last byte should be the VRID value (0-255)
+	vr.virtualRouterMACAddressIPv4, _ = net.ParseMAC(fmt.Sprintf("00-00-5E-00-01-%02X", VRID))
+	vr.virtualRouterMACAddressIPv6, _ = net.ParseMAC(fmt.Sprintf("00-00-5E-00-02-%02X", VRID))
 	vr.owner = Owner
 	//default values that defined by RFC 5798
 	if Owner {
@@ -53,7 +61,8 @@ func NewVirtualRouter(VRID byte, nif string, Owner bool, IPvX byte) *VirtualRout
 	vr.SetPriorityAndMasterAdvInterval(defaultPriority, defaultAdvertisementInterval)
 
 	//make
-	vr.protectedIPaddrs = make(map[[16]byte]bool)
+	vr.protectedIPaddrs = make(map[[16]byte]*net.Interface)
+	vr.unicastPeers = make([]net.IP, 0)
 	vr.eventChannel = make(chan EVENT, EVENTCHANNELSIZE)
 	vr.packetQueue = make(chan *VRRPPacket, PACKETQUEUESIZE)
 	vr.transitionHandler = make(map[transition]func())
@@ -72,14 +81,10 @@ func NewVirtualRouter(VRID byte, nif string, Owner bool, IPvX byte) *VirtualRout
 	}
 	if IPvX == IPv4 {
 		//set up ARP client
-		vr.ipAddrAnnouncer = NewIPv4AddrAnnouncer(NetworkInterface)
-		//set up IPv4 interface
-		vr.iplayerInterface = NewIPv4Conn(vr.preferredSourceIP, VRRPMultiAddrIPv4)
+		vr.ipAddrAnnouncer = NewIPv4AddrAnnouncer()
 	} else {
 		//set up ND client
-		vr.ipAddrAnnouncer = NewIPIPv6AddrAnnouncer(NetworkInterface)
-		//set up IPv6 interface
-		vr.iplayerInterface = NewIPv6Con(vr.preferredSourceIP, VRRPMultiAddrIPv6)
+		vr.ipAddrAnnouncer = NewIPIPv6AddrAnnouncer()
 	}
 	logger.GLoger.Printf(logger.INFO, "virtual router %v initialized, working on %v", VRID, nif)
 	return vr
@@ -124,14 +129,21 @@ func (r *VirtualRouter) SetPreemptMode(flag bool) *VirtualRouter {
 	return r
 }
 
-func (r *VirtualRouter) AddIPvXAddr(ip net.IP) {
+func (r *VirtualRouter) AddIPvXAddr(iface string, ip net.IP) error {
 	var key [16]byte
-	copy(key[:], ip)
+	copy(key[:], ip.To16())
+	networkIface, err := net.InterfaceByName(iface)
+	if err != nil {
+		logger.GLoger.Printf(logger.ERROR, "VirtualRouter.AddIPvXAddr: interface is not found for IP %v", ip)
+		return err
+	}
 	if _, ok := r.protectedIPaddrs[key]; ok {
 		logger.GLoger.Printf(logger.ERROR, "VirtualRouter.AddIPvXAddr: add redundant IP addr %v", ip)
-	} else {
-		r.protectedIPaddrs[key] = true
+		return nil
 	}
+	r.protectedIPaddrs[key] = networkIface
+	logger.GLoger.Printf(logger.INFO, "VirtualRouter.AddIPvXAddr: IP %v associated with interface %s", ip, networkIface.Name)
+	return nil
 }
 
 func (r *VirtualRouter) RemoveIPvXAddr(ip net.IP) {
@@ -150,8 +162,21 @@ func (r *VirtualRouter) sendAdvertMessage() {
 		logger.GLoger.Printf(logger.DEBUG, "send advert message of IP %v", net.IP(k[:]))
 	}
 	var x = r.assembleVRRPPacket()
-	if errOfWrite := r.iplayerInterface.WriteMessage(x); errOfWrite != nil {
-		logger.GLoger.Printf(logger.ERROR, "VirtualRouter.WriteMessage: %v", errOfWrite)
+
+	// RFC 5798: In unicast mode, send to all configured peer addresses
+	if r.unicastMode && len(r.unicastPeers) > 0 {
+		for _, peer := range r.unicastPeers {
+			if errOfWrite := r.iplayerInterface.WriteMessageTo(x, peer); errOfWrite != nil {
+				logger.GLoger.Printf(logger.ERROR, "VirtualRouter.WriteMessageTo: failed to send to peer %v: %v", peer, errOfWrite)
+			} else {
+				logger.GLoger.Printf(logger.DEBUG, "sent VRRP advertisement to unicast peer %v", peer)
+			}
+		}
+	} else {
+		// Multicast mode (default)
+		if errOfWrite := r.iplayerInterface.WriteMessage(x); errOfWrite != nil {
+			logger.GLoger.Printf(logger.ERROR, "VirtualRouter.WriteMessage: %v", errOfWrite)
+		}
 	}
 }
 
@@ -169,10 +194,16 @@ func (r *VirtualRouter) assembleVRRPPacket() *VRRPPacket {
 	}
 	var pshdr PseudoHeader
 	pshdr.Protocol = VRRPIPProtocolNumber
-	if r.ipvX == IPv4 {
-		pshdr.Daddr = VRRPMultiAddrIPv4
+	// RFC 5798: In unicast mode, use the first peer address for checksum calculation
+	// In multicast mode, use the multicast address
+	if r.unicastMode && len(r.unicastPeers) > 0 {
+		pshdr.Daddr = r.unicastPeers[0]
 	} else {
-		pshdr.Daddr = VRRPMultiAddrIPv6
+		if r.ipvX == IPv4 {
+			pshdr.Daddr = VRRPMultiAddrIPv4
+		} else {
+			pshdr.Daddr = VRRPMultiAddrIPv6
+		}
 	}
 	pshdr.Len = uint16(len(packet.ToBytes()))
 	pshdr.Saddr = r.preferredSourceIP
@@ -186,14 +217,35 @@ func (r *VirtualRouter) fetchVRRPPacket() {
 		if packet, errofFetch := r.iplayerInterface.ReadMessage(); errofFetch != nil {
 			logger.GLoger.Printf(logger.ERROR, "VirtualRouter.fetchVRRPPacket: %v", errofFetch)
 		} else {
-			if r.vrID == packet.GetVirtualRouterID() {
-				r.packetQueue <- packet
-			} else {
+			// Verify VRID matches
+			if r.vrID != packet.GetVirtualRouterID() {
 				logger.GLoger.Printf(logger.ERROR, "VirtualRouter.fetchVRRPPacket: received a advertisement with different ID: %v", packet.GetVirtualRouterID())
+				continue
 			}
 
+			// RFC 5798: In unicast mode, verify that the packet is from a configured peer
+			if r.unicastMode && len(r.unicastPeers) > 0 {
+				if packet.Pshdr == nil {
+					logger.GLoger.Printf(logger.ERROR, "VirtualRouter.fetchVRRPPacket: packet missing pseudo header")
+					continue
+				}
+				senderIP := packet.Pshdr.Saddr
+				peerFound := false
+				for _, peer := range r.unicastPeers {
+					if peer.Equal(senderIP) {
+						peerFound = true
+						break
+					}
+				}
+				if !peerFound {
+					logger.GLoger.Printf(logger.DEBUG, "VirtualRouter.fetchVRRPPacket: received packet from non-peer address %v in unicast mode, ignoring", senderIP)
+					continue
+				}
+			}
+
+			r.packetQueue <- packet
+			logger.GLoger.Printf(logger.DEBUG, "VirtualRouter.fetchVRRPPacket: received one advertisement")
 		}
-		logger.GLoger.Printf(logger.DEBUG, "VirtualRouter.fetchVRRPPacket: received one advertisement")
 	}
 }
 
@@ -364,7 +416,7 @@ func (r *VirtualRouter) eventLoop() {
 			select {
 			case packet := <-r.packetQueue:
 				if packet.GetPriority() == 0 {
-					logger.GLoger.Printf(logger.INFO, "received an advertisement with priority 0, transit into MASTER state", r.vrID)
+					logger.GLoger.Printf(logger.INFO, "received an advertisement with priority 0, transit into MASTER state (VRID %v)", r.vrID)
 					//Set the Master_Down_Timer to Skew_Time
 					r.resetMasterDownTimerToSkewTime()
 				} else {
@@ -484,7 +536,7 @@ func (r *VirtualRouter) eventSelector() {
 				}
 			case packet := <-r.packetQueue: //process incoming advertisement
 				if packet.GetPriority() == 0 {
-					logger.GLoger.Printf(logger.INFO, "received an advertisement with priority 0, transit into MASTER state", r.vrID)
+					logger.GLoger.Printf(logger.INFO, "received an advertisement with priority 0, transit into MASTER state (VRID %v)", r.vrID)
 					//Set the Master_Down_Timer to Skew_Time
 					r.resetMasterDownTimerToSkewTime()
 				} else {
@@ -517,6 +569,7 @@ func (vr *VirtualRouter) StartWithEventLoop() {
 	go func() {
 		vr.eventChannel <- START
 	}()
+
 	vr.eventLoop()
 }
 
@@ -525,9 +578,97 @@ func (vr *VirtualRouter) StartWithEventSelector() {
 	go func() {
 		vr.eventChannel <- START
 	}()
+
 	vr.eventSelector()
 }
 
 func (vr *VirtualRouter) Stop() {
 	vr.eventChannel <- SHUTDOWN
+}
+
+// SetUnicastMode enables or disables unicast mode (RFC 5798)
+// When enabled, VRRP advertisements will be sent to configured unicast peer addresses
+// instead of the multicast address.SetUnicastMode must be called before StartWithEventSelector or StartWithEventLoop
+func (vr *VirtualRouter) SetUnicastMode(enabled bool) *VirtualRouter {
+	vr.unicastMode = enabled
+	if enabled {
+		logger.GLoger.Printf(logger.INFO, "unicast mode enabled for virtual router %v", vr.vrID)
+	} else {
+		logger.GLoger.Printf(logger.INFO, "unicast mode disabled (multicast mode) for virtual router %v", vr.vrID)
+	}
+	if vr.ipvX == IPv4 {
+		//set up IPv4 interface
+		if vr.unicastMode {
+			vr.iplayerInterface = NewIPv4ConnUnicast(vr.preferredSourceIP, vr.unicastPeers[0])
+		} else {
+			vr.iplayerInterface = NewIPv4ConnMulticast(vr.preferredSourceIP, VRRPMultiAddrIPv4)
+		}
+	} else {
+		//set up IPv6 interface
+		if vr.unicastMode {
+			vr.iplayerInterface = NewIPv6ConUnicast(vr.preferredSourceIP, vr.unicastPeers[0])
+		} else {
+			vr.iplayerInterface = NewIPv6ConMulticast(vr.preferredSourceIP, VRRPMultiAddrIPv6)
+		}
+	}
+	return vr
+}
+
+// IsUnicastMode returns whether unicast mode is enabled
+func (vr *VirtualRouter) IsUnicastMode() bool {
+	return vr.unicastMode
+}
+
+// AddUnicastPeer adds a unicast peer address for RFC 5798 unicast mode
+// In unicast mode, VRRP advertisements will be sent to all configured peer addresses
+// AddUnicastPeer must be called before SetUnicastMode
+func (vr *VirtualRouter) AddUnicastPeer(peer net.IP) *VirtualRouter {
+	// Validate that peer address matches the IP version
+	if vr.ipvX == IPv4 && peer.To4() == nil {
+		logger.GLoger.Printf(logger.ERROR, "AddUnicastPeer: IPv4 virtual router cannot have IPv6 peer %v", peer)
+		return vr
+	}
+	if vr.ipvX == IPv6 && peer.To4() != nil {
+		logger.GLoger.Printf(logger.ERROR, "AddUnicastPeer: IPv6 virtual router cannot have IPv4 peer %v", peer)
+		return vr
+	}
+
+	// Check if peer already exists
+	for _, existingPeer := range vr.unicastPeers {
+		if existingPeer.Equal(peer) {
+			logger.GLoger.Printf(logger.DEBUG, "AddUnicastPeer: peer %v already exists", peer)
+			return vr
+		}
+	}
+
+	vr.unicastPeers = append(vr.unicastPeers, peer)
+	logger.GLoger.Printf(logger.INFO, "unicast peer %v added to virtual router %v", peer, vr.vrID)
+	return vr
+}
+
+// RemoveUnicastPeer removes a unicast peer address
+func (vr *VirtualRouter) RemoveUnicastPeer(peer net.IP) *VirtualRouter {
+	for i, existingPeer := range vr.unicastPeers {
+		if existingPeer.Equal(peer) {
+			vr.unicastPeers = append(vr.unicastPeers[:i], vr.unicastPeers[i+1:]...)
+			logger.GLoger.Printf(logger.INFO, "unicast peer %v removed from virtual router %v", peer, vr.vrID)
+			return vr
+		}
+	}
+	logger.GLoger.Printf(logger.ERROR, "RemoveUnicastPeer: peer %v not found", peer)
+	return vr
+}
+
+// ClearUnicastPeers removes all unicast peer addresses
+func (vr *VirtualRouter) ClearUnicastPeers() *VirtualRouter {
+	vr.unicastPeers = make([]net.IP, 0)
+	logger.GLoger.Printf(logger.INFO, "all unicast peers cleared for virtual router %v", vr.vrID)
+	return vr
+}
+
+// GetUnicastPeers returns a copy of the unicast peer addresses list
+func (vr *VirtualRouter) GetUnicastPeers() []net.IP {
+	peers := make([]net.IP, len(vr.unicastPeers))
+	copy(peers, vr.unicastPeers)
+	return peers
 }
