@@ -124,7 +124,13 @@ func (ar *IPv4AddrAnnouncer) AnnounceAll(vr *VirtualRouter) error {
 		packet.SenderIP = address
 		packet.TargetHardwareAddr = BaordcastHADDR
 		packet.TargetIP = address
-		logger.GLoger.Printf(logger.INFO, "send gratuitous arp for %v via %s", net.IP(k[:]), iface.Name)
+		logger.GLoger.Printf(logger.INFO, "send gratuitous response arp for %v via %s", net.IP(k[:]), iface.Name)
+		if errofsendarp := client.WriteTo(packet, BaordcastHADDR); errofsendarp != nil {
+			return fmt.Errorf("IPv4AddrAnnouncer.AnnounceAll: %v", errofsendarp)
+		}
+		packet.Operation = 1
+		packet.TargetHardwareAddr = ZeroHADDR
+		logger.GLoger.Printf(logger.INFO, "send gratuitous request arp for %v via %s", net.IP(k[:]), iface.Name)
 		if errofsendarp := client.WriteTo(packet, BaordcastHADDR); errofsendarp != nil {
 			return fmt.Errorf("IPv4AddrAnnouncer.AnnounceAll: %v", errofsendarp)
 		}

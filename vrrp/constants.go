@@ -46,6 +46,7 @@ var VRRPMultiAddrIPv4 = net.IPv4(224, 0, 0, 18)
 var VRRPMultiAddrIPv6 = net.ParseIP("FF02:0:0:0:0:0:0:12")
 
 var BaordcastHADDR, _ = net.ParseMAC("ff:ff:ff:ff:ff:ff")
+var ZeroHADDR, _ = net.ParseMAC("00:00:00:00:00:00")
 
 type EVENT byte
 
