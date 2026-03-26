@@ -99,7 +99,7 @@ func (ar *IPv4AddrAnnouncer) makeGratuitousPacket() *arp.Packet {
 	packet.ProtocolType = 0x0800 //IPv4
 	packet.HardwareAddrLength = 6
 	packet.IPLength = 4
-	packet.Operation = 2 //response
+	packet.Operation = arp.OperationRequest
 	return &packet
 }
 
@@ -118,21 +118,30 @@ func (ar *IPv4AddrAnnouncer) AnnounceAll(vr *VirtualRouter) error {
 		if errofSetDealLine := client.SetWriteDeadline(time.Now().Add(500 * time.Microsecond)); errofSetDealLine != nil {
 			return fmt.Errorf("IPv4AddrAnnouncer.AnnounceAll: %v", errofSetDealLine)
 		}
-		packet := ar.makeGratuitousPacket()
-		address := netip.AddrFrom4(netip.AddrFrom16(k).As4())
-		packet.SenderHardwareAddr = iface.HardwareAddr
-		packet.SenderIP = address
-		packet.TargetHardwareAddr = BaordcastHADDR
-		packet.TargetIP = address
-		logger.GLoger.Printf(logger.INFO, "send gratuitous response arp for %v via %s", net.IP(k[:]), iface.Name)
-		if errofsendarp := client.WriteTo(packet, BaordcastHADDR); errofsendarp != nil {
-			return fmt.Errorf("IPv4AddrAnnouncer.AnnounceAll: %v", errofsendarp)
+		for i := 0; i < 5; i++ {
+			packet := ar.makeGratuitousPacket()
+			address := netip.AddrFrom4(netip.AddrFrom16(k).As4())
+			packet.SenderHardwareAddr = BroaddcastHADDR
+			packet.SenderIP = address
+			packet.TargetHardwareAddr = BroaddcastHADDR
+			packet.TargetIP = address
+			logger.GLoger.Printf(logger.INFO, "send gratuitous response arp for %v via %s", net.IP(k[:]), iface.Name)
+			if errofsendarp := client.WriteTo(packet, BroaddcastHADDR); errofsendarp != nil {
+				return fmt.Errorf("IPv4AddrAnnouncer.AnnounceAll: %v", errofsendarp)
+			}
 		}
-		packet.Operation = 1
-		packet.TargetHardwareAddr = ZeroHADDR
-		logger.GLoger.Printf(logger.INFO, "send gratuitous request arp for %v via %s", net.IP(k[:]), iface.Name)
-		if errofsendarp := client.WriteTo(packet, BaordcastHADDR); errofsendarp != nil {
-			return fmt.Errorf("IPv4AddrAnnouncer.AnnounceAll: %v", errofsendarp)
+		for i := 0; i < 5; i++ {
+			packet := ar.makeGratuitousPacket()
+			address := netip.AddrFrom4(netip.AddrFrom16(k).As4())
+			packet.SenderIP = address
+			packet.TargetIP = address
+			packet.Operation = arp.OperationReply
+			packet.TargetHardwareAddr = iface.HardwareAddr
+			packet.SenderHardwareAddr = iface.HardwareAddr
+			logger.GLoger.Printf(logger.INFO, "send gratuitous request arp for %v via %s", net.IP(k[:]), iface.Name)
+			if errofsendarp := client.WriteTo(packet, BroaddcastHADDR); errofsendarp != nil {
+				return fmt.Errorf("IPv4AddrAnnouncer.AnnounceAll: %v", errofsendarp)
+			}
 		}
 	}
 	return nil

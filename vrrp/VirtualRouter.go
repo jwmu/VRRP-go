@@ -34,6 +34,7 @@ type VirtualRouter struct {
 	packetQueue         chan *VRRPPacket
 	advertisementTicker *time.Ticker
 	masterDownTimer     *time.Timer
+	gratuitousArpTimer  *time.Timer
 	transitionHandler   map[transition]func()
 }
 
@@ -286,6 +287,28 @@ func (r *VirtualRouter) resetMasterDownTimerToSkewTime() {
 	r.masterDownTimer.Reset(time.Duration(r.skewTime*10) * time.Millisecond)
 }
 
+func (r *VirtualRouter) makeGarpTimer() {
+	if r.gratuitousArpTimer == nil {
+		r.gratuitousArpTimer = time.NewTimer(60 * time.Second)
+	} else {
+		r.resetGarpTimer()
+	}
+}
+
+func (r *VirtualRouter) resetGarpTimer() {
+	r.stopGarpTimer()
+	r.gratuitousArpTimer.Reset(60 * time.Second)
+}
+
+func (r *VirtualRouter) stopGarpTimer() {
+	if !r.gratuitousArpTimer.Stop() {
+		select {
+		case <-r.gratuitousArpTimer.C:
+		default:
+		}
+	}
+}
+
 func (r *VirtualRouter) Enroll(transition2 transition, handler func()) bool {
 	if _, ok := r.transitionHandler[transition2]; ok {
 		logger.GLoger.Printf(logger.INFO, fmt.Sprintf("VirtualRouter.Enroll(): handler of transition [%s] overwrited", transition2))
@@ -504,6 +527,11 @@ func (r *VirtualRouter) eventSelector() {
 				}
 			case <-r.advertisementTicker.C: //check if advertisement timer fired
 				r.sendAdvertMessage()
+			case <-r.gratuitousArpTimer.C:
+				if errOfARP := r.ipAddrAnnouncer.AnnounceAll(r); errOfARP != nil {
+					logger.GLoger.Printf(logger.ERROR, "VirtualRouter.EventLoop: %v", errOfARP)
+				}
+				r.resetGarpTimer()
 			case packet := <-r.packetQueue: //process incoming advertisement
 				if packet.GetPriority() == 0 {
 					//I don't think we should anything here
@@ -551,15 +579,15 @@ func (r *VirtualRouter) eventSelector() {
 			case <-r.masterDownTimer.C: //Master_Down_Timer fired
 				// Send an ADVERTISEMENT
 				r.sendAdvertMessage()
-				if errOfARP := r.ipAddrAnnouncer.AnnounceAll(r); errOfARP != nil {
-					logger.GLoger.Printf(logger.ERROR, "VirtualRouter.EventLoop: %v", errOfARP)
-				}
 				//Set the Advertisement Timer to Advertisement interval
 				r.makeAdvertTicker()
 				r.state = MASTER
 				r.transitionDoWork(Backup2Master)
+				if errOfARP := r.ipAddrAnnouncer.AnnounceAll(r); errOfARP != nil {
+					logger.GLoger.Printf(logger.ERROR, "VirtualRouter.EventLoop: %v", errOfARP)
+				}
+				r.makeGarpTimer()
 			}
-
 		}
 	}
 }
