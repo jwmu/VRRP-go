@@ -28,7 +28,7 @@ type VirtualRouter struct {
 	interfaceByName      func(string) (*net.Interface, error)
 	heartbeatInterface   string
 	heartbeatDownMaster  bool
-	heartbeatOverride    bool
+	faultOwnsVIPs        bool
 	heartbeatSubscribe   func(string, byte, chan<- heartbeatLinkUpdate, <-chan struct{}) error
 	heartbeatMu          sync.RWMutex
 	heartbeatUp          bool
@@ -260,6 +260,9 @@ func (r *VirtualRouter) RemoveIPvXAddr(ip net.IP) {
 }
 
 func (r *VirtualRouter) sendAdvertMessage() {
+	if r.state == FAULT {
+		return
+	}
 	for k := range r.protectedIPaddrs {
 		logger.GLoger.Printf(logger.DEBUG, "send advert message of IP %v", net.IP(k[:]))
 	}
@@ -542,6 +545,7 @@ func (r *VirtualRouter) enterMaster(trans transition) {
 			logger.GLoger.Printf(logger.ERROR, "VirtualRouter.activateManagedVIPs: %v", err)
 		}
 	}
+	r.state = MASTER
 	r.sendAdvertMessage()
 	if errOfarp := r.ipAddrAnnouncer.AnnounceAll(r); errOfarp != nil {
 		logger.GLoger.Printf(logger.ERROR, "VirtualRouter.EventLoop: %v", errOfarp)
@@ -552,7 +556,6 @@ func (r *VirtualRouter) enterMaster(trans transition) {
 		r.stopAdvertTicker()
 		r.makeAdvertTicker()
 	}
-	r.state = MASTER
 	if trans >= 0 {
 		r.transitionDoWork(trans)
 	}
@@ -584,48 +587,33 @@ func (r *VirtualRouter) enterOperationalState(masterTransition, backupTransition
 	r.enterBackup(backupTransition, true)
 }
 
-func (r *VirtualRouter) enterHeartbeatDownState(from int) {
-	r.heartbeatOverride = true
+func (r *VirtualRouter) enterFault(from int) {
+	r.stopStateTimers()
 	if r.heartbeatDownMaster {
-		switch from {
-		case INIT:
-			r.enterMaster(Init2Master)
-		case BACKUP:
-			r.enterMaster(Backup2Master)
-		case MASTER:
-			// Stay master while heartbeat is down.
+		r.faultOwnsVIPs = true
+		if from != MASTER {
+			if err := r.activateManagedVIPs(); err != nil {
+				logger.GLoger.Printf(logger.ERROR, "VirtualRouter.activateManagedVIPs: %v", err)
+			}
+			if err := r.ipAddrAnnouncer.AnnounceAll(r); err != nil {
+				logger.GLoger.Printf(logger.ERROR, "VirtualRouter.enterFault: %v", err)
+			}
 		}
-		return
+	} else {
+		r.faultOwnsVIPs = false
+		if err := r.deactivateManagedVIPs(); err != nil {
+			logger.GLoger.Printf(logger.ERROR, "VirtualRouter.deactivateManagedVIPs: %v", err)
+		}
 	}
-
-	switch from {
-	case INIT:
-		r.enterBackup(Init2Backup, false)
-	case MASTER:
-		r.enterBackup(Master2Backup, false)
-	case BACKUP:
-		r.enterBackup(-1, false)
-	}
+	r.state = FAULT
 }
 
 func (r *VirtualRouter) recoverFromHeartbeatDown() {
-	if !r.heartbeatOverride {
+	if r.state != FAULT {
 		return
 	}
-	r.heartbeatOverride = false
-	if r.priority == 255 || r.owner {
-		if r.state != MASTER {
-			r.enterMaster(Backup2Master)
-		}
-		return
-	}
-	if r.state == MASTER {
-		r.enterBackup(Master2Backup, true)
-		return
-	}
-	if r.state == BACKUP {
-		r.enterBackup(-1, true)
-	}
+	r.faultOwnsVIPs = false
+	r.enterOperationalState(Init2Master, Init2Backup)
 }
 
 func (r *VirtualRouter) shutdownResources() {
@@ -671,13 +659,13 @@ func (r *VirtualRouter) eventSelector() {
 				}
 				if event == HEARTBEAT_DOWN {
 					logger.GLoger.Printf(logger.INFO, "heartbeat interface %s down", r.heartbeatInterface)
-					r.enterHeartbeatDownState(INIT)
+					r.enterFault(INIT)
 					continue
 				}
 				if event == START {
 					logger.GLoger.Printf(logger.INFO, "event %v received", event)
 					if !r.isHeartbeatUp() {
-						r.enterHeartbeatDownState(INIT)
+						r.enterFault(INIT)
 						continue
 					}
 					r.enterOperationalState(Init2Master, Init2Backup)
@@ -704,11 +692,7 @@ func (r *VirtualRouter) eventSelector() {
 				}
 				if event == HEARTBEAT_DOWN {
 					logger.GLoger.Printf(logger.INFO, "heartbeat interface %s down", r.heartbeatInterface)
-					r.enterHeartbeatDownState(MASTER)
-					continue
-				}
-				if event == HEARTBEAT_UP {
-					r.recoverFromHeartbeatDown()
+					r.enterFault(MASTER)
 					continue
 				}
 			case <-r.advertisementTicker.C: //check if advertisement timer fired
@@ -756,17 +740,10 @@ func (r *VirtualRouter) eventSelector() {
 				}
 				if event == HEARTBEAT_DOWN {
 					logger.GLoger.Printf(logger.INFO, "heartbeat interface %s down", r.heartbeatInterface)
-					r.enterHeartbeatDownState(BACKUP)
-					continue
-				}
-				if event == HEARTBEAT_UP {
-					r.recoverFromHeartbeatDown()
+					r.enterFault(BACKUP)
 					continue
 				}
 			case packet := <-r.packetQueue: //process incoming advertisement
-				if r.heartbeatOverride && !r.heartbeatDownMaster {
-					continue
-				}
 				if packet.GetPriority() == 0 {
 					logger.GLoger.Printf(logger.INFO, "received an advertisement with priority 0, transit into MASTER state (VRID %v)", r.vrID)
 					//Set the Master_Down_Timer to Skew_Time
@@ -794,6 +771,22 @@ func (r *VirtualRouter) eventSelector() {
 					logger.GLoger.Printf(logger.ERROR, "VirtualRouter.EventLoop: %v", errOfARP)
 				}
 				r.makeGarpTimer(r.garpMasterDelay)
+			}
+		case FAULT:
+			select {
+			case event := <-r.eventChannel:
+				if event == SHUTDOWN {
+					r.faultOwnsVIPs = false
+					r.shutdownResources()
+					r.state = INIT
+					return
+				}
+				if event == HEARTBEAT_UP {
+					r.recoverFromHeartbeatDown()
+					continue
+				}
+			case <-r.packetQueue:
+				continue
 			}
 		}
 	}

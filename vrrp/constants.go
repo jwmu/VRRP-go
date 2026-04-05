@@ -35,6 +35,7 @@ const (
 	INIT = iota
 	MASTER
 	BACKUP
+	FAULT
 )
 
 const (

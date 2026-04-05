@@ -26,6 +26,11 @@ type mockIPConnection struct {
 	closed bool
 }
 
+type recordingIPConnection struct {
+	mockIPConnection
+	writes int
+}
+
 func (m *mockARPClient) WriteTo(_ *arp.Packet, _ net.HardwareAddr) error {
 	m.mu.Lock()
 	m.writeTimes = append(m.writeTimes, time.Now())
@@ -94,6 +99,26 @@ func (m *mockIPConnection) isClosed() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.closed
+}
+
+func (m *recordingIPConnection) WriteMessage(_ *VRRPPacket) error {
+	m.mu.Lock()
+	m.writes++
+	m.mu.Unlock()
+	return nil
+}
+
+func (m *recordingIPConnection) WriteMessageTo(_ *VRRPPacket, _ net.IP) error {
+	m.mu.Lock()
+	m.writes++
+	m.mu.Unlock()
+	return nil
+}
+
+func (m *recordingIPConnection) writeCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.writes
 }
 
 func TestAssembleVRRPPacketForDestinationRecomputesChecksumPerPeer(t *testing.T) {
@@ -299,7 +324,7 @@ func TestStopIsIdempotentAndNonBlocking(t *testing.T) {
 	vr.shutdownResources()
 }
 
-func TestHeartbeatDownDefaultsToBackupAndRecoveryStaysBackupForNonOwner(t *testing.T) {
+func TestHeartbeatDownTransitionsToFaultAndRecoveryReturnsToBackupForNonOwner(t *testing.T) {
 	announcer := &mockAddrAnnouncer{}
 	conn := &mockIPConnection{}
 	timer := time.NewTimer(time.Minute)
@@ -317,6 +342,7 @@ func TestHeartbeatDownDefaultsToBackupAndRecoveryStaysBackupForNonOwner(t *testi
 		masterDownTimer:       timer,
 		stopSignal:            make(chan struct{}),
 		heartbeatInterface:    "eth0",
+		protectedIPaddrs:      make(map[[16]byte]*net.Interface),
 	}
 
 	vr.setHeartbeatStatus(true)
@@ -329,21 +355,17 @@ func TestHeartbeatDownDefaultsToBackupAndRecoveryStaysBackupForNonOwner(t *testi
 
 	vr.eventChannel <- HEARTBEAT_DOWN
 	time.Sleep(50 * time.Millisecond)
-	if vr.state != BACKUP {
-		t.Fatalf("expected heartbeat down to leave router in BACKUP, got %d", vr.state)
+	if vr.state != FAULT {
+		t.Fatalf("expected heartbeat down to move router into FAULT, got %d", vr.state)
 	}
-	if !vr.heartbeatOverride {
-		t.Fatal("expected heartbeat override to be active after link down")
+	if vr.faultOwnsVIPs {
+		t.Fatal("expected non-owner FAULT state to release VIP ownership")
 	}
 
-	vr.setHeartbeatStatus(true)
 	vr.eventChannel <- HEARTBEAT_UP
 	time.Sleep(50 * time.Millisecond)
 	if vr.state != BACKUP {
-		t.Fatalf("expected non-owner recovery to remain BACKUP, got %d", vr.state)
-	}
-	if vr.heartbeatOverride {
-		t.Fatal("expected heartbeat override to clear after recovery")
+		t.Fatalf("expected non-owner recovery to return to BACKUP, got %d", vr.state)
 	}
 
 	vr.eventChannel <- SHUTDOWN
@@ -354,7 +376,7 @@ func TestHeartbeatDownDefaultsToBackupAndRecoveryStaysBackupForNonOwner(t *testi
 	}
 }
 
-func TestHeartbeatDownCanForceMasterAndRecoveryDemotesByPriority(t *testing.T) {
+func TestHeartbeatDownWithMasterOverrideStaysInFaultAndOwnsVIPs(t *testing.T) {
 	announcer := &mockAddrAnnouncer{}
 	conn := &mockIPConnection{}
 	timer := time.NewTimer(time.Minute)
@@ -373,6 +395,7 @@ func TestHeartbeatDownCanForceMasterAndRecoveryDemotesByPriority(t *testing.T) {
 		stopSignal:            make(chan struct{}),
 		heartbeatInterface:    "eth0",
 		heartbeatDownMaster:   true,
+		protectedIPaddrs:      make(map[[16]byte]*net.Interface),
 	}
 	vr.setHeartbeatStatus(true)
 
@@ -383,31 +406,154 @@ func TestHeartbeatDownCanForceMasterAndRecoveryDemotesByPriority(t *testing.T) {
 	}()
 
 	vr.eventChannel <- HEARTBEAT_DOWN
-	deadline := time.Now().Add(500 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		if vr.state == MASTER {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
+	time.Sleep(50 * time.Millisecond)
+	if vr.state != FAULT {
+		t.Fatalf("expected heartbeat down override to enter FAULT, got %d", vr.state)
 	}
-	if vr.state != MASTER {
-		t.Fatalf("expected heartbeat down override to promote MASTER, got %d", vr.state)
+	if !vr.faultOwnsVIPs {
+		t.Fatal("expected heartbeatDownMaster to retain VIP ownership while in FAULT")
 	}
 
-	vr.setHeartbeatStatus(true)
 	vr.eventChannel <- HEARTBEAT_UP
-	deadline = time.Now().Add(500 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		if vr.state == BACKUP && !vr.heartbeatOverride {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	time.Sleep(50 * time.Millisecond)
 	if vr.state != BACKUP {
-		t.Fatalf("expected recovery to demote non-owner back to BACKUP, got %d", vr.state)
+		t.Fatalf("expected non-owner recovery to return to BACKUP, got %d", vr.state)
 	}
-	if vr.heartbeatOverride {
-		t.Fatal("expected heartbeat override to clear after recovery")
+
+	vr.eventChannel <- SHUTDOWN
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("eventSelector did not return after shutdown")
+	}
+}
+
+func TestSendAdvertMessageSkipsFaultState(t *testing.T) {
+	conn := &recordingIPConnection{}
+	vr := &VirtualRouter{
+		state:            FAULT,
+		iplayerInterface: conn,
+		protectedIPaddrs: make(map[[16]byte]*net.Interface),
+	}
+
+	vr.sendAdvertMessage()
+
+	if conn.writeCount() != 0 {
+		t.Fatalf("expected no adverts to be sent in FAULT, got %d writes", conn.writeCount())
+	}
+}
+
+func TestFaultStateIgnoresIncomingAdvertisements(t *testing.T) {
+	announcer := &mockAddrAnnouncer{}
+	conn := &recordingIPConnection{}
+
+	vr := &VirtualRouter{
+		state:                 FAULT,
+		priority:              100,
+		advertisementInterval: 100,
+		ipAddrAnnouncer:       announcer,
+		iplayerInterface:      conn,
+		eventChannel:          make(chan EVENT, 4),
+		packetQueue:           make(chan *VRRPPacket, 1),
+		transitionHandler:     make(map[transition]func()),
+		stopSignal:            make(chan struct{}),
+		heartbeatInterface:    "eth0",
+		protectedIPaddrs:      make(map[[16]byte]*net.Interface),
+	}
+	vr.setHeartbeatStatus(false)
+
+	packet := &VRRPPacket{}
+	packet.SetPriority(200)
+	packet.Pshdr = &PseudoHeader{Saddr: net.IPv4(192, 0, 2, 2).To16()}
+
+	done := make(chan struct{})
+	go func() {
+		vr.eventSelector()
+		close(done)
+	}()
+
+	vr.packetQueue <- packet
+	time.Sleep(50 * time.Millisecond)
+	if vr.state != FAULT {
+		t.Fatalf("expected router to remain in FAULT after advertisement, got %d", vr.state)
+	}
+	if conn.writeCount() != 0 {
+		t.Fatalf("expected FAULT to ignore advertisements without sending replies, got %d writes", conn.writeCount())
+	}
+
+	vr.eventChannel <- SHUTDOWN
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("eventSelector did not return after shutdown")
+	}
+}
+
+func TestFaultShutdownDoesNotSendPriorityZeroAdvertisement(t *testing.T) {
+	announcer := &mockAddrAnnouncer{}
+	conn := &recordingIPConnection{}
+
+	vr := &VirtualRouter{
+		state:            FAULT,
+		ipAddrAnnouncer:  announcer,
+		iplayerInterface: conn,
+		eventChannel:     make(chan EVENT, 1),
+		packetQueue:      make(chan *VRRPPacket, 1),
+		stopSignal:       make(chan struct{}),
+	}
+
+	done := make(chan struct{})
+	go func() {
+		vr.eventSelector()
+		close(done)
+	}()
+
+	vr.eventChannel <- SHUTDOWN
+
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("eventSelector did not return after shutdown")
+	}
+
+	if conn.writeCount() != 0 {
+		t.Fatalf("expected shutdown from FAULT to avoid advert sends, got %d writes", conn.writeCount())
+	}
+}
+
+func TestHeartbeatUpRecoversOwnerFromFaultToMasterAndSendsAdvert(t *testing.T) {
+	announcer := &mockAddrAnnouncer{}
+	conn := &recordingIPConnection{}
+
+	vr := &VirtualRouter{
+		state:                 FAULT,
+		owner:                 true,
+		priority:              255,
+		advertisementInterval: 100,
+		ipAddrAnnouncer:       announcer,
+		iplayerInterface:      conn,
+		eventChannel:          make(chan EVENT, 1),
+		packetQueue:           make(chan *VRRPPacket, 1),
+		transitionHandler:     make(map[transition]func()),
+		stopSignal:            make(chan struct{}),
+		heartbeatInterface:    "eth0",
+		protectedIPaddrs:      make(map[[16]byte]*net.Interface),
+	}
+
+	done := make(chan struct{})
+	go func() {
+		vr.eventSelector()
+		close(done)
+	}()
+
+	vr.eventChannel <- HEARTBEAT_UP
+	time.Sleep(50 * time.Millisecond)
+
+	if vr.state != MASTER {
+		t.Fatalf("expected owner recovery to return to MASTER, got %d", vr.state)
+	}
+	if conn.writeCount() == 0 {
+		t.Fatal("expected owner recovery from FAULT to send an advertisement")
 	}
 
 	vr.eventChannel <- SHUTDOWN
