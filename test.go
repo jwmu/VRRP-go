@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"time"
+
 	VRRP "github.com/jwmu/VRRP-go/vrrp"
 )
 
@@ -19,7 +20,11 @@ func init() {
 
 func main() {
 	flag.Parse()
-	var vr = VRRP.NewVirtualRouter(byte(VRID), "ens3", false, VRRP.IPv4)
+	vr, err := VRRP.NewVirtualRouter(byte(VRID), "ens3", false, VRRP.IPv4)
+	if err != nil {
+		fmt.Printf("NewVirtualRouter: %v\n", err)
+		return
+	}
 	vr.SetPriorityAndMasterAdvInterval(byte(Priority), time.Millisecond*800)
 	vr.Enroll(VRRP.Backup2Master, func() {
 		fmt.Println("init to master")

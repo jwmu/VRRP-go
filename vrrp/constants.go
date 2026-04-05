@@ -53,6 +53,8 @@ type EVENT byte
 const (
 	SHUTDOWN EVENT = iota
 	START
+	HEARTBEAT_UP
+	HEARTBEAT_DOWN
 )
 
 func (e EVENT) String() string {
@@ -61,6 +63,10 @@ func (e EVENT) String() string {
 		return "START"
 	case SHUTDOWN:
 		return "SHUTDOWN"
+	case HEARTBEAT_UP:
+		return "HEARTBEAT_UP"
+	case HEARTBEAT_DOWN:
+		return "HEARTBEAT_DOWN"
 	default:
 		return "unknown event"
 	}
@@ -68,6 +74,24 @@ func (e EVENT) String() string {
 
 const PACKETQUEUESIZE = 1000
 const EVENTCHANNELSIZE = 1
+
+type GratuitousARPOperation byte
+
+const (
+	GratuitousARPRequest GratuitousARPOperation = iota
+	GratuitousARPReply
+)
+
+func (o GratuitousARPOperation) String() string {
+	switch o {
+	case GratuitousARPRequest:
+		return "request"
+	case GratuitousARPReply:
+		return "reply"
+	default:
+		return "unknown"
+	}
+}
 
 type transition int
 
@@ -103,4 +127,5 @@ var (
 	defaultPreempt                    = true
 	defaultPriority              byte = 100
 	defaultAdvertisementInterval      = 1 * time.Second
+	defaultGARPThrottleInterval       = 10 * time.Millisecond
 )

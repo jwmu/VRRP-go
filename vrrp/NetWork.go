@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"sync"
 
 	"github.com/jwmu/VRRP-go/logger"
 
@@ -18,18 +19,102 @@ type IPConnection interface {
 	WriteMessage(*VRRPPacket) error
 	WriteMessageTo(*VRRPPacket, net.IP) error // Write message to a specific unicast address
 	ReadMessage() (*VRRPPacket, error)
+	Close() error
 }
 
 type AddrAnnouncer interface {
 	AnnounceAll(vr *VirtualRouter) error
+	Close() error
+}
+
+type arpClient interface {
+	WriteTo(*arp.Packet, net.HardwareAddr) error
+	Close() error
+}
+
+type arpInterfaceSender struct {
+	mu               sync.Mutex
+	client           arpClient
+	throttleInterval time.Duration
+	queue            chan *arp.Packet
+	closed           bool
+	wg               sync.WaitGroup
 }
 
 type IPv4AddrAnnouncer struct {
-	arpClients map[int]*arp.Client
+	mu      sync.Mutex
+	senders map[int]*arpInterfaceSender
 }
 
 type IPv6AddrAnnouncer struct {
 	ndpConns map[int]*ndp.Conn
+}
+
+func newARPInterfaceSender(client arpClient, throttleInterval time.Duration) *arpInterfaceSender {
+	sender := &arpInterfaceSender{
+		client:           client,
+		throttleInterval: throttleInterval,
+		queue:            make(chan *arp.Packet, 64),
+	}
+	sender.wg.Add(1)
+	go sender.run()
+	return sender
+}
+
+func (s *arpInterfaceSender) run() {
+	defer s.wg.Done()
+	var lastSent time.Time
+	for packet := range s.queue {
+		throttleInterval := s.getThrottleInterval()
+		if !lastSent.IsZero() && throttleInterval > 0 {
+			if wait := throttleInterval - time.Since(lastSent); wait > 0 {
+				time.Sleep(wait)
+			}
+		}
+		err := s.client.WriteTo(packet, BroaddcastHADDR)
+		if err == nil {
+			lastSent = time.Now()
+		}
+	}
+}
+
+func (s *arpInterfaceSender) enqueue(packet *arp.Packet) error {
+	s.mu.Lock()
+
+	if s.closed {
+		s.mu.Unlock()
+		err := fmt.Errorf("arpInterfaceSender.enqueue: sender closed")
+		return err
+	}
+	s.mu.Unlock()
+	s.queue <- packet
+	return nil
+}
+
+func (s *arpInterfaceSender) setThrottleInterval(interval time.Duration) {
+	s.mu.Lock()
+	s.throttleInterval = interval
+	s.mu.Unlock()
+}
+
+func (s *arpInterfaceSender) getThrottleInterval() time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.throttleInterval
+}
+
+func (s *arpInterfaceSender) close() error {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return nil
+	}
+	s.closed = true
+	close(s.queue)
+	s.mu.Unlock()
+
+	s.wg.Wait()
+	return s.client.Close()
 }
 
 func NewIPIPv6AddrAnnouncer() *IPv6AddrAnnouncer {
@@ -92,82 +177,126 @@ func (nd *IPv6AddrAnnouncer) AnnounceAll(vr *VirtualRouter) error {
 	return nil
 }
 
-// makeGratuitousPacket make gratuitous ARP packet with out payload
-func (ar *IPv4AddrAnnouncer) makeGratuitousPacket() *arp.Packet {
+func (nd *IPv6AddrAnnouncer) Close() error {
+	var firstErr error
+	for index, conn := range nd.ndpConns {
+		if err := conn.Close(); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("IPv6AddrAnnouncer.Close: interface %d: %v", index, err)
+		}
+		delete(nd.ndpConns, index)
+	}
+	return firstErr
+}
+
+// makeGratuitousPacket builds a gratuitous ARP packet for the requested operation.
+func (ar *IPv4AddrAnnouncer) makeGratuitousPacket(address netip.Addr, hardwareAddr net.HardwareAddr, operation GratuitousARPOperation) (*arp.Packet, error) {
 	var packet arp.Packet
 	packet.HardwareType = 1      //ethernet10m
 	packet.ProtocolType = 0x0800 //IPv4
 	packet.HardwareAddrLength = 6
 	packet.IPLength = 4
-	packet.Operation = arp.OperationRequest
-	return &packet
+	packet.SenderHardwareAddr = hardwareAddr
+	packet.SenderIP = address
+	packet.TargetHardwareAddr = BroaddcastHADDR
+	packet.TargetIP = address
+
+	switch operation {
+	case GratuitousARPRequest:
+		packet.Operation = arp.OperationRequest
+	case GratuitousARPReply:
+		packet.Operation = arp.OperationReply
+	default:
+		return nil, fmt.Errorf("IPv4AddrAnnouncer.makeGratuitousPacket: unsupported gratuitous ARP operation %d", operation)
+	}
+
+	return &packet, nil
 }
 
-// AnnounceAll send gratuitous ARP response for all protected IPv4 addresses
+// AnnounceAll sends the configured gratuitous ARP operation for all protected IPv4 addresses.
 func (ar *IPv4AddrAnnouncer) AnnounceAll(vr *VirtualRouter) error {
 	for k, iface := range vr.protectedIPaddrs {
 		if iface == nil {
 			logger.GLoger.Printf(logger.ERROR, "IPv4AddrAnnouncer.AnnounceAll: interface missing for IP %v", net.IP(k[:]))
 			return fmt.Errorf("IPv4AddrAnnouncer.AnnounceAll: interface missing for IP %v", net.IP(k[:]))
 		}
-		client, err := ar.getClientForInterface(iface)
+		sender, err := ar.getSenderForInterface(iface, vr.garpThrottleInterval)
 		if err != nil {
 			logger.GLoger.Printf(logger.ERROR, "IPv4AddrAnnouncer.AnnounceAll: %v", err)
 			return err
 		}
-		if errofSetDealLine := client.SetWriteDeadline(time.Now().Add(500 * time.Microsecond)); errofSetDealLine != nil {
-			return fmt.Errorf("IPv4AddrAnnouncer.AnnounceAll: %v", errofSetDealLine)
-		}
-		for i := 0; i < 5; i++ {
-			packet := ar.makeGratuitousPacket()
-			address := netip.AddrFrom4(netip.AddrFrom16(k).As4())
-			packet.SenderHardwareAddr = BroaddcastHADDR
-			packet.SenderIP = address
-			packet.TargetHardwareAddr = BroaddcastHADDR
-			packet.TargetIP = address
-			logger.GLoger.Printf(logger.INFO, "send gratuitous response arp for %v via %s", net.IP(k[:]), iface.Name)
-			if errofsendarp := client.WriteTo(packet, BroaddcastHADDR); errofsendarp != nil {
-				return fmt.Errorf("IPv4AddrAnnouncer.AnnounceAll: %v", errofsendarp)
+
+		address := netip.AddrFrom4(netip.AddrFrom16(k).As4())
+		for i := 0; i < vr.garpMasterRepeat; i++ {
+			packet, err := ar.makeGratuitousPacket(address, iface.HardwareAddr, vr.garpOperation)
+			if err != nil {
+				return err
+			}
+			err = sender.enqueue(packet)
+			if err != nil {
+				return err
 			}
 		}
-		for i := 0; i < 5; i++ {
-			packet := ar.makeGratuitousPacket()
-			address := netip.AddrFrom4(netip.AddrFrom16(k).As4())
-			packet.SenderIP = address
-			packet.TargetIP = address
-			packet.Operation = arp.OperationReply
-			packet.TargetHardwareAddr = iface.HardwareAddr
-			packet.SenderHardwareAddr = iface.HardwareAddr
-			logger.GLoger.Printf(logger.INFO, "send gratuitous request arp for %v via %s", net.IP(k[:]), iface.Name)
-			if errofsendarp := client.WriteTo(packet, BroaddcastHADDR); errofsendarp != nil {
-				return fmt.Errorf("IPv4AddrAnnouncer.AnnounceAll: %v", errofsendarp)
-			}
-		}
+		logger.GLoger.Printf(logger.INFO, "send gratuitous %s arp for %v via %s", vr.garpOperation, net.IP(k[:]), iface.Name)
 	}
 	return nil
 }
 
 func NewIPv4AddrAnnouncer() *IPv4AddrAnnouncer {
 	announcer := &IPv4AddrAnnouncer{
-		arpClients: make(map[int]*arp.Client),
+		senders: make(map[int]*arpInterfaceSender),
 	}
 	return announcer
 }
 
-func (ar *IPv4AddrAnnouncer) getClientForInterface(iface *net.Interface) (*arp.Client, error) {
+func (ar *IPv4AddrAnnouncer) Close() error {
+	ar.mu.Lock()
+	senders := make([]*arpInterfaceSender, 0, len(ar.senders))
+	for index, sender := range ar.senders {
+		senders = append(senders, sender)
+		delete(ar.senders, index)
+	}
+	ar.mu.Unlock()
+
+	var firstErr error
+	for _, sender := range senders {
+		if err := sender.close(); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("IPv4AddrAnnouncer.Close: %v", err)
+		}
+	}
+	return firstErr
+}
+
+func (ar *IPv4AddrAnnouncer) getSenderForInterface(iface *net.Interface, throttleInterval time.Duration) (*arpInterfaceSender, error) {
 	if iface == nil {
-		return nil, fmt.Errorf("IPv4AddrAnnouncer.getClientForInterface: nil interface provided")
+		return nil, fmt.Errorf("IPv4AddrAnnouncer.getSenderForInterface: nil interface provided")
 	}
-	if client, ok := ar.arpClients[iface.Index]; ok {
-		return client, nil
+	ar.mu.Lock()
+	if sender, ok := ar.senders[iface.Index]; ok {
+		sender.setThrottleInterval(throttleInterval)
+		ar.mu.Unlock()
+		return sender, nil
 	}
+	ar.mu.Unlock()
+
 	client, err := arp.Dial(iface)
 	if err != nil {
-		return nil, fmt.Errorf("IPv4AddrAnnouncer.getClientForInterface: %v", err)
+		return nil, fmt.Errorf("IPv4AddrAnnouncer.getSenderForInterface: %v", err)
 	}
-	ar.arpClients[iface.Index] = client
 	logger.GLoger.Printf(logger.DEBUG, "IPv4AddrAnnouncer: initialized ARP client on interface %s", iface.Name)
-	return client, nil
+	sender := newARPInterfaceSender(client, throttleInterval)
+
+	ar.mu.Lock()
+	if existing, ok := ar.senders[iface.Index]; ok {
+		existing.setThrottleInterval(throttleInterval)
+		ar.mu.Unlock()
+		if err := sender.close(); err != nil {
+			logger.GLoger.Printf(logger.ERROR, "IPv4AddrAnnouncer.getSenderForInterface: close redundant sender on %s: %v", iface.Name, err)
+		}
+		return existing, nil
+	}
+	ar.senders[iface.Index] = sender
+	ar.mu.Unlock()
+	return sender, nil
 }
 
 type IPv4Con struct {
@@ -177,6 +306,7 @@ type IPv4Con struct {
 	SendCon    *net.IPConn
 	ReceiveCon *net.IPConn
 	isUnicast  bool
+	closeOnce  sync.Once
 }
 
 type IPv6Con struct {
@@ -186,6 +316,7 @@ type IPv6Con struct {
 	local     net.IP
 	Con       *net.IPConn
 	isUnicast bool
+	closeOnce sync.Once
 }
 
 func ipConnection(local, remote net.IP) (*net.IPConn, error) {
@@ -378,6 +509,23 @@ func (conn *IPv4Con) ReadMessage() (*VRRPPacket, error) {
 	}
 }
 
+func (conn *IPv4Con) Close() error {
+	var firstErr error
+	conn.closeOnce.Do(func() {
+		if conn.SendCon != nil {
+			if err := conn.SendCon.Close(); err != nil && firstErr == nil {
+				firstErr = fmt.Errorf("IPv4Con.Close: send connection: %v", err)
+			}
+		}
+		if conn.ReceiveCon != nil {
+			if err := conn.ReceiveCon.Close(); err != nil && firstErr == nil {
+				firstErr = fmt.Errorf("IPv4Con.Close: receive connection: %v", err)
+			}
+		}
+	})
+	return firstErr
+}
+
 func NewIPv6ConMulticast(local, remote net.IP) *IPv6Con {
 	var con, errOfNewIPv6Con = ipConnection(local, remote)
 	if errOfNewIPv6Con != nil {
@@ -483,6 +631,18 @@ func (con *IPv6Con) ReadMessage() (*VRRPPacket, error) {
 	}
 	advertisement.Pshdr = &pshdr
 	return advertisement, nil
+}
+
+func (con *IPv6Con) Close() error {
+	var firstErr error
+	con.closeOnce.Do(func() {
+		if con.Con != nil {
+			if err := con.Con.Close(); err != nil {
+				firstErr = fmt.Errorf("IPv6Con.Close: %v", err)
+			}
+		}
+	})
+	return firstErr
 }
 
 func findIPbyInterface(itf *net.Interface, IPvX byte) (net.IP, error) {
