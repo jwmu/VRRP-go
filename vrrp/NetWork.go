@@ -421,14 +421,15 @@ func joinIPv6MulticastGroup(con *net.IPConn, local, remote net.IP) error {
 	return nil
 }
 
-func NewIPv4ConnMulticast(local, remote net.IP) IPConnection {
-	var SendConn, errOfMakeIPConn = ipConnection(local, remote)
-	if errOfMakeIPConn != nil {
-		panic(errOfMakeIPConn)
+func NewIPv4ConnMulticast(local, remote net.IP) (IPConnection, error) {
+	SendConn, err := ipConnection(local, remote)
+	if err != nil {
+		return nil, err
 	}
-	var receiveConn, errOfMakeRecv = makeMulticastIPv4Conn(VRRPMultiAddrIPv4, local)
-	if errOfMakeRecv != nil {
-		panic(errOfMakeRecv)
+	receiveConn, err := makeMulticastIPv4Conn(VRRPMultiAddrIPv4, local)
+	if err != nil {
+		SendConn.Close()
+		return nil, err
 	}
 	return &IPv4Con{
 		buffer:     make([]byte, 2048),
@@ -437,18 +438,19 @@ func NewIPv4ConnMulticast(local, remote net.IP) IPConnection {
 		SendCon:    SendConn,
 		ReceiveCon: receiveConn,
 		isUnicast:  false,
-	}
+	}, nil
 
 }
 
-func NewIPv4ConnUnicast(local, remote net.IP) IPConnection {
-	var sendConn, errOfMakeIPConn = ipConnection(local, remote)
-	if errOfMakeIPConn != nil {
-		panic(errOfMakeIPConn)
+func NewIPv4ConnUnicast(local, remote net.IP) (IPConnection, error) {
+	sendConn, err := ipConnection(local, remote)
+	if err != nil {
+		return nil, err
 	}
-	var reveiveConn, errOfListenIP = net.ListenIP("ip4:112", &net.IPAddr{IP: net.IPv4zero})
-	if errOfListenIP != nil {
-		panic(errOfListenIP)
+	reveiveConn, err := net.ListenIP("ip4:112", &net.IPAddr{IP: net.IPv4zero})
+	if err != nil {
+		sendConn.Close()
+		return nil, err
 	}
 	return &IPv4Con{
 		buffer:     make([]byte, 2048),
@@ -457,7 +459,7 @@ func NewIPv4ConnUnicast(local, remote net.IP) IPConnection {
 		SendCon:    sendConn,
 		ReceiveCon: reveiveConn,
 		isUnicast:  true,
-	}
+	}, nil
 }
 
 func (conn *IPv4Con) WriteMessage(packet *VRRPPacket) error {
@@ -526,13 +528,14 @@ func (conn *IPv4Con) Close() error {
 	return firstErr
 }
 
-func NewIPv6ConMulticast(local, remote net.IP) *IPv6Con {
-	var con, errOfNewIPv6Con = ipConnection(local, remote)
-	if errOfNewIPv6Con != nil {
-		panic(fmt.Errorf("NewIPv6Con: %v", errOfNewIPv6Con))
+func NewIPv6ConMulticast(local, remote net.IP) (IPConnection, error) {
+	con, err := ipConnection(local, remote)
+	if err != nil {
+		return nil, err
 	}
-	if errOfJoinMG := joinIPv6MulticastGroup(con, local, remote); errOfJoinMG != nil {
-		panic(fmt.Errorf("NewIPv6Con: %v", errOfJoinMG))
+	if err := joinIPv6MulticastGroup(con, local, remote); err != nil {
+		con.Close()
+		return nil, err
 	}
 	return &IPv6Con{
 		buffer: make([]byte, 4096),
@@ -540,13 +543,13 @@ func NewIPv6ConMulticast(local, remote net.IP) *IPv6Con {
 		local:  local,
 		remote: remote,
 		Con:    con,
-	}
+	}, nil
 }
 
-func NewIPv6ConUnicast(local, remote net.IP) *IPv6Con {
-	var con, errOfNewIPv6Con = ipConnection(local, remote)
-	if errOfNewIPv6Con != nil {
-		panic(fmt.Errorf("NewIPv6Con: %v", errOfNewIPv6Con))
+func NewIPv6ConUnicast(local, remote net.IP) (IPConnection, error) {
+	con, err := ipConnection(local, remote)
+	if err != nil {
+		return nil, err
 	}
 	return &IPv6Con{
 		buffer:    make([]byte, 4096),
@@ -555,7 +558,7 @@ func NewIPv6ConUnicast(local, remote net.IP) *IPv6Con {
 		remote:    remote,
 		Con:       con,
 		isUnicast: true,
-	}
+	}, nil
 }
 
 func (con *IPv6Con) WriteMessage(packet *VRRPPacket) error {

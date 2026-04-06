@@ -110,6 +110,16 @@ func (t transition) String() string {
 		return "backup to init"
 	case Master2Init:
 		return "master to init"
+	case Master2Fault:
+		return "master to fault"
+	case Backup2Fault:
+		return "backup to fault"
+	case Init2Fault:
+		return "init to fault"
+	case Fault2Master:
+		return "fault to master"
+	case Fault2Backup:
+		return "fault to backup"
 	default:
 		return "unknown transition"
 	}
@@ -122,11 +132,17 @@ const (
 	Init2Backup
 	Master2Init
 	Backup2Init
+	Master2Fault
+	Backup2Fault
+	Init2Fault
+	Fault2Master
+	Fault2Backup
 )
 
 var (
 	defaultPreempt                    = true
 	defaultPriority              byte = 100
 	defaultAdvertisementInterval      = 1 * time.Second
-	defaultGARPThrottleInterval       = 10 * time.Millisecond
+	defaultGARPThrottleInterval       = 5 * time.Millisecond
+	defaultGARPSendInterval           = 60
 )

@@ -116,7 +116,7 @@ func heartbeatLinkUpdateIsUp(update netlink.LinkUpdate) bool {
 }
 
 func heartbeatLinkIsUp(flags net.Flags) bool {
-	return flags&net.FlagUp != 0
+	return flags&net.FlagRunning != 0
 }
 
 func linkFlagsFromUpdate(update netlink.LinkUpdate) net.Flags {

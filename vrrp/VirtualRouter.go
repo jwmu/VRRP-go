@@ -25,45 +25,50 @@ type VirtualRouter struct {
 	unicastMode  bool
 	unicastPeers []net.IP // Unicast peer addresses for RFC 5798 unicast mode
 	//
-	interfaceByName      func(string) (*net.Interface, error)
-	heartbeatInterface   string
-	heartbeatDownMaster  bool
-	faultOwnsVIPs        bool
-	heartbeatSubscribe   func(string, byte, chan<- heartbeatLinkUpdate, <-chan struct{}) error
-	heartbeatMu          sync.RWMutex
-	heartbeatUp          bool
-	heartbeatKnown       bool
-	ipvX                 byte
-	preferredSourceIP    net.IP
-	protectedIPaddrs     map[[16]byte]*net.Interface
-	managedVIPs          map[[16]byte]*managedVIP
-	managedVMACs         map[string]string
-	state                int
-	iplayerInterface     IPConnection
-	ipAddrAnnouncer      AddrAnnouncer
-	netlinkOps           netlinkOps
-	garpMasterRepeat     int
-	garpMasterDelay      int
-	garpThrottleInterval time.Duration
-	garpOperation        GratuitousARPOperation
-	eventChannel         chan EVENT
-	packetQueue          chan *VRRPPacket
-	advertisementTicker  *time.Ticker
-	masterDownTimer      *time.Timer
-	gratuitousArpTimer   *time.Timer
-	transitionHandler    map[transition]func()
-	stopSignal           chan struct{}
-	shutdownOnce         sync.Once
-	stopRequestOnce      sync.Once
+	interfaceByName        func(string) (*net.Interface, error)
+	heartbeatInterface     string
+	heartbeatDownMaster    bool
+	faultOwnsVIPs          bool
+	heartbeatSubscribe     func(string, byte, chan<- heartbeatLinkUpdate, <-chan struct{}) error
+	heartbeatMu            sync.RWMutex
+	heartbeatUp            bool
+	heartbeatKnown         bool
+	ipvX                   byte
+	preferredSourceIP      net.IP
+	protectedIPaddrs       map[[16]byte]*net.Interface
+	managedVIPs            map[[16]byte]*managedVIP
+	managedVMACs           map[string]string
+	state                  int
+	iplayerInterface       IPConnection
+	ipAddrAnnouncer        AddrAnnouncer
+	netlinkOps             netlinkOps
+	garpMasterRepeat       int
+	garpMasterDelay        int
+	garpMasterSendInterval int
+	garpThrottleInterval   time.Duration
+	garpOperation          GratuitousARPOperation
+	eventChannel           chan EVENT
+	packetQueue            chan *VRRPPacket
+	advertisementTicker    *time.Ticker
+	masterDownTimer        *time.Timer
+	gratuitousArpTimer     *time.Timer
+	transitionHandler      map[transition]func(int)
+	stopSignal             chan struct{}
+	shutdownOnce           sync.Once
+	stopRequestOnce        sync.Once
 }
 
 // NewVirtualRouter create a new virtual router with designated parameters
 func NewVirtualRouter(VRID byte, nif string, Owner bool, IPvX byte) (*VirtualRouter, error) {
+	if VRID == 0 {
+		return nil, fmt.Errorf("NewVirtualRouter: VRID must be in range 1-255")
+	}
 	if IPvX != IPv4 && IPvX != IPv6 {
 		return nil, fmt.Errorf("NewVirtualRouter: parameter IPvx must be IPv4 or IPv6")
 	}
 	var vr = &VirtualRouter{}
 	vr.interfaceByName = net.InterfaceByName
+	vr.ipvX = IPvX
 	var NetworkInterface, errOfGetIF = vr.lookupInterface(nif)
 	if errOfGetIF != nil {
 		return nil, fmt.Errorf("NewVirtualRouter: %v", errOfGetIF)
@@ -87,7 +92,8 @@ func NewVirtualRouter(VRID byte, nif string, Owner bool, IPvX byte) (*VirtualRou
 	vr.SetAdvInterval(defaultAdvertisementInterval)
 	vr.SetPriorityAndMasterAdvInterval(defaultPriority, defaultAdvertisementInterval)
 	vr.garpMasterRepeat = 5
-	vr.garpMasterDelay = 1
+	vr.garpMasterDelay = 12
+	vr.garpMasterSendInterval = defaultGARPSendInterval
 	vr.garpThrottleInterval = defaultGARPThrottleInterval
 	//make
 	vr.protectedIPaddrs = make(map[[16]byte]*net.Interface)
@@ -96,16 +102,15 @@ func NewVirtualRouter(VRID byte, nif string, Owner bool, IPvX byte) (*VirtualRou
 	vr.unicastPeers = make([]net.IP, 0)
 	vr.eventChannel = make(chan EVENT, EVENTCHANNELSIZE)
 	vr.packetQueue = make(chan *VRRPPacket, PACKETQUEUESIZE)
-	vr.transitionHandler = make(map[transition]func())
+	vr.transitionHandler = make(map[transition]func(int))
 	vr.netlinkOps = systemNetlinkOps{}
 	vr.stopSignal = make(chan struct{})
 	vr.heartbeatSubscribe = defaultHeartbeatSubscribe
 
-	vr.ipvX = IPvX
-
 	//find preferred local IP address
-	if preferred, errOfGetPreferred := findIPbyInterface(NetworkInterface, IPvX); errOfGetPreferred != nil {
-		logger.GLoger.Printf(logger.FATAL, "NewVirtualRouter: %v", errOfGetPreferred)
+	if preferred, err := findIPbyInterface(NetworkInterface, IPvX); err != nil {
+		logger.GLoger.Printf(logger.ERROR, "NewVirtualRouter: %v", err)
+		return nil, err
 	} else {
 		vr.preferredSourceIP = preferred
 	}
@@ -113,13 +118,21 @@ func NewVirtualRouter(VRID byte, nif string, Owner bool, IPvX byte) (*VirtualRou
 		//set up ARP client
 		vr.ipAddrAnnouncer = NewIPv4AddrAnnouncer()
 		if vr.preferredSourceIP != nil {
-			vr.iplayerInterface = NewIPv4ConnMulticast(vr.preferredSourceIP, VRRPMultiAddrIPv4)
+			var err error
+			vr.iplayerInterface, err = NewIPv4ConnMulticast(vr.preferredSourceIP, VRRPMultiAddrIPv4)
+			if err != nil {
+				return nil, fmt.Errorf("NewVirtualRouter: %v", err)
+			}
 		}
 	} else {
 		//set up ND client
 		vr.ipAddrAnnouncer = NewIPIPv6AddrAnnouncer()
 		if vr.preferredSourceIP != nil {
-			vr.iplayerInterface = NewIPv6ConMulticast(vr.preferredSourceIP, VRRPMultiAddrIPv6)
+			var err error
+			vr.iplayerInterface, err = NewIPv6ConMulticast(vr.preferredSourceIP, VRRPMultiAddrIPv6)
+			if err != nil {
+				return nil, fmt.Errorf("NewVirtualRouter: %v", err)
+			}
 		}
 	}
 	logger.GLoger.Printf(logger.INFO, "virtual router %v initialized, working on %v", VRID, nif)
@@ -238,7 +251,7 @@ func (r *VirtualRouter) checkHeartbeatInterface() bool {
 	if err != nil {
 		return false
 	}
-	if ifc.Flags&net.FlagUp == 0 {
+	if ifc.Flags&net.FlagRunning == 0 {
 		return false
 	}
 	addrs, err := ifc.Addrs()
@@ -263,9 +276,9 @@ func (r *VirtualRouter) sendAdvertMessage() {
 	if r.state == FAULT {
 		return
 	}
-	for k := range r.protectedIPaddrs {
-		logger.GLoger.Printf(logger.DEBUG, "send advert message of IP %v", net.IP(k[:]))
-	}
+	// for k := range r.protectedIPaddrs {
+	// 	logger.GLoger.Printf(logger.DEBUG, "send advert message of IP %v", net.IP(k[:]))
+	// }
 
 	// RFC 5798: In unicast mode, send to all configured peer addresses
 	if r.unicastMode && len(r.unicastPeers) > 0 {
@@ -356,7 +369,7 @@ func (r *VirtualRouter) fetchVRRPPacket() {
 			case <-r.stopSignal:
 				return
 			}
-			logger.GLoger.Printf(logger.DEBUG, "VirtualRouter.fetchVRRPPacket: received one advertisement")
+			//logger.GLoger.Printf(logger.DEBUG, "VirtualRouter.fetchVRRPPacket: received one advertisement")
 		}
 	}
 }
@@ -385,6 +398,8 @@ func (r *VirtualRouter) stopMasterDownTimer() {
 		return
 	}
 	logger.GLoger.Printf(logger.DEBUG, "master down timer stopped")
+	// IMPORTANT: Stop() must be paired with selective drain of C to prevent
+	// channel leakage or stale firing if the timer already expired.
 	if !r.masterDownTimer.Stop() {
 		select {
 		case <-r.masterDownTimer.C:
@@ -416,13 +431,13 @@ func (r *VirtualRouter) makeGarpTimer(dur int) {
 	if r.gratuitousArpTimer == nil {
 		r.gratuitousArpTimer = time.NewTimer(time.Duration(dur) * time.Second)
 	} else {
-		r.resetGarpTimer()
+		r.resetGarpTimer(dur)
 	}
 }
 
-func (r *VirtualRouter) resetGarpTimer() {
+func (r *VirtualRouter) resetGarpTimer(dur int) {
 	r.stopGarpTimer()
-	r.gratuitousArpTimer.Reset(60 * time.Second)
+	r.gratuitousArpTimer.Reset(time.Duration(dur) * time.Second)
 }
 
 func (r *VirtualRouter) stopGarpTimer() {
@@ -437,7 +452,7 @@ func (r *VirtualRouter) stopGarpTimer() {
 	}
 }
 
-func (r *VirtualRouter) Enroll(transition2 transition, handler func()) bool {
+func (r *VirtualRouter) Enroll(transition2 transition, handler func(int)) bool {
 	if _, ok := r.transitionHandler[transition2]; ok {
 		logger.GLoger.Printf(logger.INFO, fmt.Sprintf("VirtualRouter.Enroll(): handler of transition [%s] overwrited", transition2))
 		r.transitionHandler[transition2] = handler
@@ -454,7 +469,7 @@ func (r *VirtualRouter) transitionDoWork(t transition) {
 		//return fmt.Errorf("VirtualRouter.transitionDoWork(): handler of [%s] does not exist", t)
 		return
 	}
-	work()
+	work(r.state)
 	logger.GLoger.Printf(logger.INFO, fmt.Sprintf("handler of transition [%s] called", t))
 }
 
@@ -577,21 +592,11 @@ func (r *VirtualRouter) enterBackup(trans transition, startTimer bool) {
 	}
 }
 
-func (r *VirtualRouter) enterOperationalState(masterTransition, backupTransition transition) {
-	if r.priority == 255 || r.owner {
-		logger.GLoger.Printf(logger.INFO, "enter owner mode")
-		r.enterMaster(masterTransition)
-		return
-	}
-	logger.GLoger.Printf(logger.INFO, "VR is not the owner of protected IP addresses")
-	r.enterBackup(backupTransition, true)
-}
-
-func (r *VirtualRouter) enterFault(from int) {
+func (r *VirtualRouter) enterFault(trans transition) {
 	r.stopStateTimers()
 	if r.heartbeatDownMaster {
 		r.faultOwnsVIPs = true
-		if from != MASTER {
+		if trans != Master2Fault {
 			if err := r.activateManagedVIPs(); err != nil {
 				logger.GLoger.Printf(logger.ERROR, "VirtualRouter.activateManagedVIPs: %v", err)
 			}
@@ -606,14 +611,9 @@ func (r *VirtualRouter) enterFault(from int) {
 		}
 	}
 	r.state = FAULT
-}
-
-func (r *VirtualRouter) recoverFromHeartbeatDown() {
-	if r.state != FAULT {
-		return
+	if trans >= 0 {
+		r.transitionDoWork(trans)
 	}
-	r.faultOwnsVIPs = false
-	r.enterOperationalState(Init2Master, Init2Backup)
 }
 
 func (r *VirtualRouter) shutdownResources() {
@@ -634,7 +634,8 @@ func (r *VirtualRouter) shutdownResources() {
 // ///////////////////////////////////////
 func largerThan(ip1, ip2 net.IP) bool {
 	if len(ip1) != len(ip2) {
-		logger.GLoger.Printf(logger.FATAL, "largerThan: two compared IP addresses must have the same length")
+		logger.GLoger.Printf(logger.ERROR, "largerThan: two compared IP addresses must have the same length")
+		return false
 	}
 	for index := range ip1 {
 		if ip1[index] > ip2[index] {
@@ -646,6 +647,17 @@ func largerThan(ip1, ip2 net.IP) bool {
 	return false
 }
 
+func (r *VirtualRouter) shutdownAll(trans transition) {
+	if err := r.deactivateManagedVIPs(); err != nil {
+		logger.GLoger.Printf(logger.ERROR, "VirtualRouter.deactivateManagedVIPs: %v", err)
+	}
+	r.shutdownResources()
+	r.state = INIT
+	if trans >= 0 {
+		r.transitionDoWork(trans)
+	}
+}
+
 // eventSelector VRRP event selector to handle various triggered events
 func (r *VirtualRouter) eventSelector() {
 	for {
@@ -653,22 +665,26 @@ func (r *VirtualRouter) eventSelector() {
 		case INIT:
 			select {
 			case event := <-r.eventChannel:
-				if event == SHUTDOWN {
+				switch event {
+				case SHUTDOWN:
 					r.shutdownResources()
 					return
-				}
-				if event == HEARTBEAT_DOWN {
+				case HEARTBEAT_DOWN:
 					logger.GLoger.Printf(logger.INFO, "heartbeat interface %s down", r.heartbeatInterface)
-					r.enterFault(INIT)
-					continue
-				}
-				if event == START {
+					r.enterFault(Init2Fault)
+				case START:
 					logger.GLoger.Printf(logger.INFO, "event %v received", event)
 					if !r.isHeartbeatUp() {
-						r.enterFault(INIT)
+						r.enterFault(Init2Fault)
 						continue
 					}
-					r.enterOperationalState(Init2Master, Init2Backup)
+					if r.priority == 255 || r.owner {
+						logger.GLoger.Printf(logger.INFO, "enter owner mode")
+						r.enterMaster(Init2Master)
+						continue
+					}
+					logger.GLoger.Printf(logger.INFO, "VR is not the owner of protected IP addresses")
+					r.enterBackup(Init2Backup, true)
 				}
 			}
 		case MASTER:
@@ -677,51 +693,39 @@ func (r *VirtualRouter) eventSelector() {
 			case event := <-r.eventChannel:
 				if event == SHUTDOWN {
 					//send advertisement with priority 0
-					var priority = r.priority
+					priority := r.priority
 					r.SetPriority(0)
 					r.sendAdvertMessage()
 					r.SetPriority(priority)
-					if err := r.deactivateManagedVIPs(); err != nil {
-						logger.GLoger.Printf(logger.ERROR, "VirtualRouter.deactivateManagedVIPs: %v", err)
-					}
-					r.shutdownResources()
-					r.state = INIT
-					r.transitionDoWork(Master2Init)
+
+					r.shutdownAll(Master2Init)
 					logger.GLoger.Printf(logger.INFO, "event %v received", event)
 					return
 				}
 				if event == HEARTBEAT_DOWN {
 					logger.GLoger.Printf(logger.INFO, "heartbeat interface %s down", r.heartbeatInterface)
-					r.enterFault(MASTER)
-					continue
+					r.enterFault(Master2Fault)
 				}
 			case <-r.advertisementTicker.C: //check if advertisement timer fired
 				r.sendAdvertMessage()
 			case <-r.gratuitousArpTimer.C:
-				if errOfARP := r.ipAddrAnnouncer.AnnounceAll(r); errOfARP != nil {
-					logger.GLoger.Printf(logger.ERROR, "VirtualRouter.EventLoop: %v", errOfARP)
+				if err := r.ipAddrAnnouncer.AnnounceAll(r); err != nil {
+					logger.GLoger.Printf(logger.ERROR, "VirtualRouter.EventLoop: %v", err)
 				}
-				r.resetGarpTimer()
+				r.resetGarpTimer(r.garpMasterSendInterval)
 			case packet := <-r.packetQueue: //process incoming advertisement
-				if packet.GetPriority() == 0 {
-					//I don't think we should anything here
-				} else {
-					if packet.GetPriority() > r.priority || (packet.GetPriority() == r.priority && largerThan(packet.Pshdr.Saddr, r.preferredSourceIP)) {
-
-						//cancel Advertisement timer
-						r.stopAdvertTicker()
-						//set up master down timer
-						r.setMasterAdvInterval(packet.GetAdvertisementInterval())
-						r.makeMasterDownTimer()
-						r.sendAdvertMessage()
-						if err := r.deactivateManagedVIPs(); err != nil {
-							logger.GLoger.Printf(logger.ERROR, "VirtualRouter.deactivateManagedVIPs: %v", err)
-						}
-						r.state = BACKUP
-						r.transitionDoWork(Master2Backup)
-					} else {
-						//just discard this one
+				if packet.GetPriority() > r.priority || (packet.GetPriority() == r.priority && largerThan(packet.Pshdr.Saddr, r.preferredSourceIP)) {
+					//cancel Advertisement timer
+					r.stopAdvertTicker()
+					//set up master down timer
+					r.setMasterAdvInterval(packet.GetAdvertisementInterval())
+					r.makeMasterDownTimer()
+					r.sendAdvertMessage()
+					if err := r.deactivateManagedVIPs(); err != nil {
+						logger.GLoger.Printf(logger.ERROR, "VirtualRouter.deactivateManagedVIPs: %v", err)
 					}
+					r.state = BACKUP
+					r.transitionDoWork(Master2Backup)
 				}
 			}
 
@@ -729,19 +733,13 @@ func (r *VirtualRouter) eventSelector() {
 			select {
 			case event := <-r.eventChannel:
 				if event == SHUTDOWN {
-					if err := r.deactivateManagedVIPs(); err != nil {
-						logger.GLoger.Printf(logger.ERROR, "VirtualRouter.deactivateManagedVIPs: %v", err)
-					}
-					r.shutdownResources()
-					r.state = INIT
-					r.transitionDoWork(Backup2Init)
+					r.shutdownAll(Backup2Init)
 					logger.GLoger.Printf(logger.INFO, "event %s received", event)
 					return
 				}
 				if event == HEARTBEAT_DOWN {
 					logger.GLoger.Printf(logger.INFO, "heartbeat interface %s down", r.heartbeatInterface)
-					r.enterFault(BACKUP)
-					continue
+					r.enterFault(Backup2Fault)
 				}
 			case packet := <-r.packetQueue: //process incoming advertisement
 				if packet.GetPriority() == 0 {
@@ -753,24 +751,10 @@ func (r *VirtualRouter) eventSelector() {
 						//reset master down timer
 						r.setMasterAdvInterval(packet.GetAdvertisementInterval())
 						r.resetMasterDownTimer()
-					} else {
-						//nothing to do, just discard this one
 					}
 				}
 			case <-r.masterDownTimer.C: //Master_Down_Timer fired
-				if err := r.activateManagedVIPs(); err != nil {
-					logger.GLoger.Printf(logger.ERROR, "VirtualRouter.activateManagedVIPs: %v", err)
-				}
-				// Send an ADVERTISEMENT
-				r.sendAdvertMessage()
-				//Set the Advertisement Timer to Advertisement interval
-				r.makeAdvertTicker()
-				r.state = MASTER
-				r.transitionDoWork(Backup2Master)
-				if errOfARP := r.ipAddrAnnouncer.AnnounceAll(r); errOfARP != nil {
-					logger.GLoger.Printf(logger.ERROR, "VirtualRouter.EventLoop: %v", errOfARP)
-				}
-				r.makeGarpTimer(r.garpMasterDelay)
+				r.enterMaster(Backup2Master)
 			}
 		case FAULT:
 			select {
@@ -782,8 +766,14 @@ func (r *VirtualRouter) eventSelector() {
 					return
 				}
 				if event == HEARTBEAT_UP {
-					r.recoverFromHeartbeatDown()
-					continue
+					r.faultOwnsVIPs = false
+					if r.priority == 255 || r.owner {
+						logger.GLoger.Printf(logger.INFO, "enter owner mode")
+						r.enterMaster(Fault2Master)
+						continue
+					}
+					logger.GLoger.Printf(logger.INFO, "VR is not the owner of protected IP addresses")
+					r.enterBackup(Fault2Backup, true)
 				}
 			case <-r.packetQueue:
 				continue
@@ -831,20 +821,24 @@ func (vr *VirtualRouter) SetUnicastMode(enabled bool) *VirtualRouter {
 	} else {
 		logger.GLoger.Printf(logger.INFO, "unicast mode disabled (multicast mode) for virtual router %v", vr.vrID)
 	}
+	var err error
 	if vr.ipvX == IPv4 {
 		//set up IPv4 interface
 		if vr.unicastMode {
-			vr.iplayerInterface = NewIPv4ConnUnicast(vr.preferredSourceIP, vr.unicastPeers[0])
+			vr.iplayerInterface, err = NewIPv4ConnUnicast(vr.preferredSourceIP, vr.unicastPeers[0])
 		} else {
-			vr.iplayerInterface = NewIPv4ConnMulticast(vr.preferredSourceIP, VRRPMultiAddrIPv4)
+			vr.iplayerInterface, err = NewIPv4ConnMulticast(vr.preferredSourceIP, VRRPMultiAddrIPv4)
 		}
 	} else {
 		//set up IPv6 interface
 		if vr.unicastMode {
-			vr.iplayerInterface = NewIPv6ConUnicast(vr.preferredSourceIP, vr.unicastPeers[0])
+			vr.iplayerInterface, err = NewIPv6ConUnicast(vr.preferredSourceIP, vr.unicastPeers[0])
 		} else {
-			vr.iplayerInterface = NewIPv6ConMulticast(vr.preferredSourceIP, VRRPMultiAddrIPv6)
+			vr.iplayerInterface, err = NewIPv6ConMulticast(vr.preferredSourceIP, VRRPMultiAddrIPv6)
 		}
+	}
+	if err != nil {
+		logger.GLoger.Printf(logger.ERROR, "SetUnicastMode: failed to recreate IP connection: %v", err)
 	}
 	return vr
 }

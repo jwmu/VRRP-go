@@ -26,13 +26,13 @@ func main() {
 		return
 	}
 	vr.SetPriorityAndMasterAdvInterval(byte(Priority), time.Millisecond*800)
-	vr.Enroll(VRRP.Backup2Master, func() {
+	vr.Enroll(VRRP.Backup2Master, func(int) {
 		fmt.Println("init to master")
 	})
-	vr.Enroll(VRRP.Master2Init, func() {
+	vr.Enroll(VRRP.Master2Init, func(int) {
 		fmt.Println("master to init")
 	})
-	vr.Enroll(VRRP.Master2Backup, func() {
+	vr.Enroll(VRRP.Master2Backup, func(int) {
 		fmt.Println("master to backup")
 	})
 	go func() {

@@ -34,11 +34,9 @@ func FromBytes(IPvXVersion byte, octets []byte) (*VRRPPacket, error) {
 		return nil, errors.New("faulty VRRP packet size")
 	}
 	var packet VRRPPacket
-	for index := 0; index < 8; index++ {
-		packet.Header[index] = octets[index]
-	}
-	//todo validate the number of IPvX addresses
-	var countofaddrs = int(packet.GetIPvXAddrCount())
+	copy(packet.Header[:], octets[:8])
+	
+	countofaddrs := int(packet.GetIPvXAddrCount())
 	switch IPvXVersion {
 	case 4:
 	case 6:
@@ -46,16 +44,16 @@ func FromBytes(IPvXVersion byte, octets []byte) (*VRRPPacket, error) {
 	default:
 		return nil, fmt.Errorf("faulty IPvX version %d", IPvXVersion)
 	}
+
 	//to compatible with VRRP v2 packet, ignore the auth info
-	if 8+countofaddrs*4 > len(octets) {
-		return nil, fmt.Errorf("The value of filed IPvXAddrCount doesn't match the length of octets")
+	expectedLen := 8 + countofaddrs*4
+	if expectedLen > len(octets) {
+		return nil, fmt.Errorf("The value of field IPvXAddrCount doesn't match the length of octets (expected at least %d, got %d)", expectedLen, len(octets))
 	}
-	for index := 0; index < countofaddrs; index++ {
+
+	for i := 0; i < countofaddrs; i++ {
 		var addr [4]byte
-		addr[0] = octets[8+4*index]
-		addr[1] = octets[8+4*index+1]
-		addr[2] = octets[8+4*index+2]
-		addr[3] = octets[8+4*index+3]
+		copy(addr[:], octets[8+4*i:8+4*i+4])
 		packet.IPAddress = append(packet.IPAddress, addr)
 	}
 	return &packet, nil
@@ -64,34 +62,31 @@ func FromBytes(IPvXVersion byte, octets []byte) (*VRRPPacket, error) {
 func (packet *VRRPPacket) GetIPvXAddr(version byte) (addrs []net.IP) {
 	switch version {
 	case 4:
-		for index := range packet.IPAddress {
-			addrs = append(addrs, net.IPv4(
-				packet.IPAddress[index][0],
-				packet.IPAddress[index][1],
-				packet.IPAddress[index][2],
-				packet.IPAddress[index][3]))
+		for _, addr := range packet.IPAddress {
+			addrs = append(addrs, net.IP(addr[:]))
 		}
-		return addrs
 	case 6:
-		for index := 0; index < int(packet.GetIPvXAddrCount()); index++ {
-			var p = make(net.IP, net.IPv6len)
-			for i := 0; i < 4; i++ {
-				copy(p[4*i:], packet.IPAddress[index*4+i][:])
+		count := int(packet.GetIPvXAddrCount())
+		for i := 0; i < count; i++ {
+			ip := make(net.IP, net.IPv6len)
+			for j := 0; j < 4; j++ {
+				copy(ip[j*4:], packet.IPAddress[i*4+j][:])
 			}
-			addrs = append(addrs, p)
+			addrs = append(addrs, ip)
 		}
-		return addrs
-	default:
-		return nil
 	}
+	return addrs
 }
 
 func (packet *VRRPPacket) AddIPvXAddr(version byte, ip net.IP) {
+	if packet.GetIPvXAddrCount() >= 255 {
+		// RFC 5798: Count field is 8 bits
+		return
+	}
 	switch version {
 	case 4:
 		packet.IPAddress = append(packet.IPAddress, [4]byte{ip[12], ip[13], ip[14], ip[15]})
 		packet.setIPvXAddrCount(packet.GetIPvXAddrCount() + 1)
-		//todo byte maybe overflow
 	case 6:
 		for index := 0; index < 4; index++ {
 			packet.IPAddress = append(packet.IPAddress, [4]byte{ip[index*4+0], ip[index*4+1], ip[index*4+2], ip[index*4+3]})

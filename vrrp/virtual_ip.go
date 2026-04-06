@@ -65,7 +65,22 @@ func (r *VirtualRouter) UseVMAC() bool {
 	return r.useVMAC
 }
 
+func isValidInterfaceName(name string) bool {
+	if len(name) == 0 || len(name) > 15 {
+		return false
+	}
+	for _, c := range name {
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' || c == '-' || c == '_') {
+			return false
+		}
+	}
+	return true
+}
+
 func (r *VirtualRouter) AddVirtualIP(iface, cidr string) error {
+	if !isValidInterfaceName(iface) {
+		return fmt.Errorf("VirtualRouter.AddVirtualIP: invalid interface name %s", iface)
+	}
 	ip, _, err := net.ParseCIDR(cidr)
 	if err != nil {
 		return fmt.Errorf("VirtualRouter.AddVirtualIP: parse %s: %v", cidr, err)
