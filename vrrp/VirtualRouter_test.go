@@ -31,6 +31,61 @@ type recordingIPConnection struct {
 	writes int
 }
 
+func newBackupRouterForPreemptDelayTests(masterAdvertTicks uint16) *VirtualRouter {
+	vr := &VirtualRouter{
+		priority:              100,
+		advertisementInterval: masterAdvertTicks,
+		ipAddrAnnouncer:       &mockAddrAnnouncer{},
+		iplayerInterface:      &mockIPConnection{},
+		eventChannel:          make(chan EVENT, 1),
+		packetQueue:           make(chan *VRRPPacket, 1),
+		transitionHandler:     make(map[transition]func(int)),
+		stopSignal:            make(chan struct{}),
+		heartbeatInterface:    "eth0",
+		preferredSourceIP:     net.IPv4(192, 0, 2, 10).To16(),
+		protectedIPaddrs:      make(map[[16]byte]*net.Interface),
+	}
+	vr.setMasterAdvInterval(masterAdvertTicks)
+	vr.state = BACKUP
+	vr.makeMasterDownTimer()
+	return vr
+}
+
+func makeAdvertPacket(priority byte, adv uint16, src net.IP) *VRRPPacket {
+	packet := &VRRPPacket{
+		Pshdr: &PseudoHeader{
+			Saddr: src.To16(),
+		},
+		Header: [8]byte{
+			0x30, // VRRPv3 advert by default; the tests only care about priority/interval.
+			0,
+			priority,
+		},
+	}
+	packet.SetAdvertisementInterval(adv)
+	return packet
+}
+
+func startRouterLoop(vr *VirtualRouter) chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		vr.eventSelector()
+		close(done)
+	}()
+	return done
+}
+
+func stopRouterLoop(t *testing.T, vr *VirtualRouter, done chan struct{}) {
+	t.Helper()
+	vr.Stop()
+
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("eventSelector did not return after stopRouterLoop")
+	}
+}
+
 func (m *mockARPClient) WriteTo(_ *arp.Packet, _ net.HardwareAddr) error {
 	m.mu.Lock()
 	m.writeTimes = append(m.writeTimes, time.Now())
@@ -176,6 +231,59 @@ func TestIPv4GratuitousARPOperationDefaultsToRequest(t *testing.T) {
 	if vr.garpOperation != GratuitousARPRequest {
 		t.Fatalf("expected zero-value gratuitous ARP operation to be request, got %v", vr.garpOperation)
 	}
+}
+
+func TestSetPreemptDelayStoresDuration(t *testing.T) {
+	vr := &VirtualRouter{}
+	delay := 250 * time.Millisecond
+
+	returned := vr.SetPreemptDelay(delay)
+	if returned != vr {
+		t.Fatal("expected SetPreemptDelay to return the receiver")
+	}
+	if got := vr.preemptDelay; got != delay {
+		t.Fatalf("expected preemptDelay to be %v, got %v", delay, got)
+	}
+}
+
+func TestBackupPreemptDelayZeroPreservesCurrentTakeoverTiming(t *testing.T) {
+	vr := newBackupRouterForPreemptDelayTests(10)
+	vr.SetPreemptDelay(0)
+
+	transitionCh := make(chan transition, 1)
+	vr.Enroll(Backup2Master, func(int) {
+		transitionCh <- Backup2Master
+	})
+
+	done := startRouterLoop(vr)
+	defer stopRouterLoop(t, vr, done)
+
+	withinTimer := time.Duration(vr.masterDownInterval) * 10 * time.Millisecond / 3
+	select {
+	case trans := <-transitionCh:
+		t.Fatalf("unexpected transition before master-down expiry: %v", trans)
+	case <-time.After(withinTimer):
+	}
+
+	if vr.preemptPending {
+		t.Fatal("expected preemptPending to remain false before master-down expiry")
+	}
+
+	select {
+	case trans := <-transitionCh:
+		if trans != Backup2Master {
+			t.Fatalf("expected Backup2Master transition after master-down expiry, got %v", trans)
+		}
+	case <-time.After(time.Duration(vr.masterDownInterval)*10*time.Millisecond + 100*time.Millisecond):
+		t.Fatal("expected Backup2Master transition after master-down expiry")
+	}
+
+	if vr.preemptPending {
+		t.Fatal("expected preemptPending to remain false after master-down expiry")
+	}
+
+	// The transition handler confirms takeover timing without racing the router state.
+	// No direct state reads are needed here.
 }
 
 func TestMakeGratuitousPacketUsesConfiguredOperation(t *testing.T) {

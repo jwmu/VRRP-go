@@ -17,6 +17,9 @@ type VirtualRouter struct {
 	skewTime                      uint16
 	masterDownInterval            uint16
 	preempt                       bool
+	preemptDelay                  time.Duration
+	preemptDelayTimer             *time.Timer
+	preemptPending                bool
 	owner                         bool
 	useVMAC                       bool
 	virtualRouterMACAddressIPv4   net.HardwareAddr
@@ -175,6 +178,14 @@ func (r *VirtualRouter) setMasterAdvInterval(Interval uint16) *VirtualRouter {
 
 func (r *VirtualRouter) SetPreemptMode(flag bool) *VirtualRouter {
 	r.preempt = flag
+	return r
+}
+
+func (r *VirtualRouter) SetPreemptDelay(delay time.Duration) *VirtualRouter {
+	if delay < 0 {
+		panic("preempt delay can not be negative")
+	}
+	r.preemptDelay = delay
 	return r
 }
 
