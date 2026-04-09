@@ -95,7 +95,7 @@ func NewVirtualRouter(VRID byte, nif string, Owner bool, IPvX byte) (*VirtualRou
 	vr.SetAdvInterval(defaultAdvertisementInterval)
 	vr.SetPriorityAndMasterAdvInterval(defaultPriority, defaultAdvertisementInterval)
 	vr.garpMasterRepeat = 5
-	vr.garpMasterDelay = 12
+	vr.garpMasterDelay = 3 //12
 	vr.garpMasterSendInterval = defaultGARPSendInterval
 	vr.garpThrottleInterval = defaultGARPThrottleInterval
 	//make
@@ -438,6 +438,85 @@ func (r *VirtualRouter) resetMasterDownTimerToSkewTime() {
 	r.masterDownTimer.Reset(time.Duration(r.skewTime*10) * time.Millisecond)
 }
 
+func (r *VirtualRouter) makePreemptDelayTimer() {
+	if r.preemptDelay <= 0 {
+		return
+	}
+	if r.preemptDelayTimer == nil {
+		r.preemptDelayTimer = time.NewTimer(r.preemptDelay)
+		return
+	}
+	if !r.preemptDelayTimer.Stop() {
+		select {
+		case <-r.preemptDelayTimer.C:
+		default:
+		}
+	}
+	r.preemptDelayTimer.Reset(r.preemptDelay)
+}
+
+func (r *VirtualRouter) stopPreemptDelayTimer() {
+	if r.preemptDelayTimer == nil {
+		r.preemptPending = false
+		return
+	}
+	if !r.preemptDelayTimer.Stop() {
+		select {
+		case <-r.preemptDelayTimer.C:
+		default:
+		}
+	}
+	r.preemptDelayTimer = nil
+	r.preemptPending = false
+}
+
+func (r *VirtualRouter) clearPreemptDelay() {
+	r.stopPreemptDelayTimer()
+}
+
+func (r *VirtualRouter) handleBackupPacket(packet *VRRPPacket) bool {
+	if packet.GetPriority() == 0 {
+		logger.GLoger.Printf(logger.INFO, "received an advertisement with priority 0, transit into MASTER state (VRID %v)", r.vrID)
+		r.clearPreemptDelay()
+		//Set the Master_Down_Timer to Skew_Time
+		r.resetMasterDownTimerToSkewTime()
+		return true
+	}
+	if r.preempt && r.preemptDelay > 0 && (packet.GetPriority() < r.priority || (packet.GetPriority() == r.priority && !largerThan(packet.Pshdr.Saddr, r.preferredSourceIP))) {
+		r.setMasterAdvInterval(packet.GetAdvertisementInterval())
+		r.resetMasterDownTimer()
+		if !r.preemptPending {
+			r.preemptPending = true
+			r.makePreemptDelayTimer()
+		}
+		return false
+	}
+	if r.preempt == false || packet.GetPriority() > r.priority || (packet.GetPriority() == r.priority && largerThan(packet.Pshdr.Saddr, r.preferredSourceIP)) {
+		r.clearPreemptDelay()
+		//reset master down timer
+		r.setMasterAdvInterval(packet.GetAdvertisementInterval())
+		r.resetMasterDownTimer()
+		return true
+	}
+	return false
+}
+
+func (r *VirtualRouter) drainBackupPackets(blockOnAny bool) bool {
+	sawPacket := false
+	blocked := false
+	for {
+		select {
+		case packet := <-r.packetQueue:
+			sawPacket = true
+			if blockOnAny || r.handleBackupPacket(packet) {
+				blocked = true
+			}
+		default:
+			return sawPacket && blocked
+		}
+	}
+}
+
 func (r *VirtualRouter) makeGarpTimer(dur int) {
 	if r.gratuitousArpTimer == nil {
 		r.gratuitousArpTimer = time.NewTimer(time.Duration(dur) * time.Second)
@@ -560,12 +639,16 @@ func (r *VirtualRouter) stopStateTimers() {
 	if r.masterDownTimer != nil {
 		r.stopMasterDownTimer()
 	}
+	if r.preemptDelayTimer != nil || r.preemptPending {
+		r.clearPreemptDelay()
+	}
 	if r.gratuitousArpTimer != nil {
 		r.stopGarpTimer()
 	}
 }
 
 func (r *VirtualRouter) enterMaster(trans transition) {
+	r.clearPreemptDelay()
 	if r.state != MASTER {
 		if err := r.activateManagedVIPs(); err != nil {
 			logger.GLoger.Printf(logger.ERROR, "VirtualRouter.activateManagedVIPs: %v", err)
@@ -741,6 +824,10 @@ func (r *VirtualRouter) eventSelector() {
 			}
 
 		case BACKUP:
+			var preemptDelayTimerC <-chan time.Time
+			if r.preemptDelayTimer != nil {
+				preemptDelayTimerC = r.preemptDelayTimer.C
+			}
 			select {
 			case event := <-r.eventChannel:
 				if event == SHUTDOWN {
@@ -753,18 +840,16 @@ func (r *VirtualRouter) eventSelector() {
 					r.enterFault(Backup2Fault)
 				}
 			case packet := <-r.packetQueue: //process incoming advertisement
-				if packet.GetPriority() == 0 {
-					logger.GLoger.Printf(logger.INFO, "received an advertisement with priority 0, transit into MASTER state (VRID %v)", r.vrID)
-					//Set the Master_Down_Timer to Skew_Time
-					r.resetMasterDownTimerToSkewTime()
-				} else {
-					if r.preempt == false || packet.GetPriority() > r.priority || (packet.GetPriority() == r.priority && largerThan(packet.Pshdr.Saddr, r.preferredSourceIP)) {
-						//reset master down timer
-						r.setMasterAdvInterval(packet.GetAdvertisementInterval())
-						r.resetMasterDownTimer()
-					}
-				}
+				r.handleBackupPacket(packet)
 			case <-r.masterDownTimer.C: //Master_Down_Timer fired
+				if r.drainBackupPackets(true) {
+					continue
+				}
+				r.enterMaster(Backup2Master)
+			case <-preemptDelayTimerC:
+				if r.drainBackupPackets(false) {
+					continue
+				}
 				r.enterMaster(Backup2Master)
 			}
 		case FAULT:

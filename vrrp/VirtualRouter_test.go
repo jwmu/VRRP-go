@@ -75,6 +75,34 @@ func startRouterLoop(vr *VirtualRouter) chan struct{} {
 	return done
 }
 
+func prearmDelayedPreemption(vr *VirtualRouter, delay time.Duration) {
+	vr.preemptPending = true
+	vr.preemptDelayTimer = time.NewTimer(delay)
+}
+
+func expectNoTransitionBefore(t *testing.T, ch <-chan transition, timeout time.Duration) {
+	t.Helper()
+
+	select {
+	case trans := <-ch:
+		t.Fatalf("unexpected transition before timeout: %v", trans)
+	case <-time.After(timeout):
+	}
+}
+
+func expectTransition(t *testing.T, ch <-chan transition, want transition, timeout time.Duration) {
+	t.Helper()
+
+	select {
+	case trans := <-ch:
+		if trans != want {
+			t.Fatalf("expected transition %v, got %v", want, trans)
+		}
+	case <-time.After(timeout):
+		t.Fatalf("expected transition %v before timeout", want)
+	}
+}
+
 func stopRouterLoop(t *testing.T, vr *VirtualRouter, done chan struct{}) {
 	t.Helper()
 	vr.Stop()
@@ -256,17 +284,18 @@ func TestBackupPreemptDelayZeroPreservesCurrentTakeoverTiming(t *testing.T) {
 	})
 
 	done := startRouterLoop(vr)
-	defer stopRouterLoop(t, vr, done)
+	defer func() {
+		stopRouterLoop(t, vr, done)
+		if vr.preemptPending {
+			t.Fatal("expected preemptPending to remain false after router stopped")
+		}
+	}()
 
 	withinTimer := time.Duration(vr.masterDownInterval) * 10 * time.Millisecond / 3
 	select {
 	case trans := <-transitionCh:
 		t.Fatalf("unexpected transition before master-down expiry: %v", trans)
 	case <-time.After(withinTimer):
-	}
-
-	if vr.preemptPending {
-		t.Fatal("expected preemptPending to remain false before master-down expiry")
 	}
 
 	select {
@@ -277,13 +306,240 @@ func TestBackupPreemptDelayZeroPreservesCurrentTakeoverTiming(t *testing.T) {
 	case <-time.After(time.Duration(vr.masterDownInterval)*10*time.Millisecond + 100*time.Millisecond):
 		t.Fatal("expected Backup2Master transition after master-down expiry")
 	}
+}
 
-	if vr.preemptPending {
-		t.Fatal("expected preemptPending to remain false after master-down expiry")
+func TestBackupDelayedPreemptionWaitsForTimerBeforePromoting(t *testing.T) {
+	vr := newBackupRouterForPreemptDelayTests(10)
+	vr.SetPreemptMode(true)
+	vr.SetPreemptDelay(120 * time.Millisecond)
+
+	transitionCh := make(chan transition, 1)
+	vr.Enroll(Backup2Master, func(int) {
+		transitionCh <- Backup2Master
+	})
+
+	done := startRouterLoop(vr)
+	defer stopRouterLoop(t, vr, done)
+
+	vr.packetQueue <- makeAdvertPacket(80, 10, net.IPv4(192, 0, 2, 1))
+
+	expectNoTransitionBefore(t, transitionCh, 110*time.Millisecond)
+
+	expectTransition(t, transitionCh, Backup2Master, 200*time.Millisecond)
+}
+
+func TestBackupDelayedPreemptionStartsOnTieBreakerWin(t *testing.T) {
+	vr := newBackupRouterForPreemptDelayTests(10)
+	vr.SetPreemptMode(true)
+	vr.SetPreemptDelay(120 * time.Millisecond)
+
+	transitionCh := make(chan transition, 1)
+	vr.Enroll(Backup2Master, func(int) {
+		transitionCh <- Backup2Master
+	})
+
+	done := startRouterLoop(vr)
+	defer stopRouterLoop(t, vr, done)
+
+	vr.packetQueue <- makeAdvertPacket(100, 10, net.IPv4(192, 0, 2, 1))
+
+	expectNoTransitionBefore(t, transitionCh, 110*time.Millisecond)
+	expectTransition(t, transitionCh, Backup2Master, 200*time.Millisecond)
+}
+
+func TestBackupDelayedPreemptionRepeatedQualifyingAdvertsDoNotRestartDelay(t *testing.T) {
+	vr := newBackupRouterForPreemptDelayTests(10)
+	vr.SetPreemptMode(true)
+	vr.SetPreemptDelay(120 * time.Millisecond)
+
+	transitionCh := make(chan transition, 1)
+	vr.Enroll(Backup2Master, func(int) {
+		transitionCh <- Backup2Master
+	})
+
+	done := startRouterLoop(vr)
+	defer stopRouterLoop(t, vr, done)
+
+	vr.packetQueue <- makeAdvertPacket(80, 10, net.IPv4(192, 0, 2, 1))
+	rearm := time.AfterFunc(60*time.Millisecond, func() {
+		vr.packetQueue <- makeAdvertPacket(80, 10, net.IPv4(192, 0, 2, 2))
+	})
+	defer rearm.Stop()
+
+	expectNoTransitionBefore(t, transitionCh, 90*time.Millisecond)
+	expectTransition(t, transitionCh, Backup2Master, 160*time.Millisecond)
+}
+
+func TestBackupDelayedPreemptionTimerYieldsToQueuedDisqualifyingAdvert(t *testing.T) {
+	vr := newBackupRouterForPreemptDelayTests(10)
+	vr.SetPreemptMode(true)
+	vr.SetPreemptDelay(120 * time.Millisecond)
+	prearmDelayedPreemption(vr, 0)
+	vr.packetQueue = make(chan *VRRPPacket, 2)
+
+	transitionCh := make(chan transition, 1)
+	vr.Enroll(Backup2Master, func(int) {
+		transitionCh <- Backup2Master
+	})
+
+	vr.packetQueue <- makeAdvertPacket(80, 10, net.IPv4(192, 0, 2, 1))
+	vr.packetQueue <- makeAdvertPacket(120, 10, net.IPv4(192, 0, 2, 2))
+
+	done := startRouterLoop(vr)
+	defer stopRouterLoop(t, vr, done)
+
+	expectNoTransitionBefore(t, transitionCh, 80*time.Millisecond)
+}
+
+func TestBackupPreemptDelayIgnoredWhenPreemptDisabled(t *testing.T) {
+	vr := newBackupRouterForPreemptDelayTests(10)
+	vr.SetPreemptMode(false)
+	vr.SetPreemptDelay(120 * time.Millisecond)
+
+	transitionCh := make(chan transition, 1)
+	vr.Enroll(Backup2Master, func(int) {
+		transitionCh <- Backup2Master
+	})
+
+	done := startRouterLoop(vr)
+	defer stopRouterLoop(t, vr, done)
+
+	vr.packetQueue <- makeAdvertPacket(80, 10, net.IPv4(192, 0, 2, 1))
+
+	expectNoTransitionBefore(t, transitionCh, 150*time.Millisecond)
+}
+
+func TestBackupDelayedPreemptionCancelsOnHigherPriorityAdvertisement(t *testing.T) {
+	vr := newBackupRouterForPreemptDelayTests(10)
+	vr.SetPreemptMode(true)
+	vr.SetPreemptDelay(120 * time.Millisecond)
+
+	transitionCh := make(chan transition, 1)
+	vr.Enroll(Backup2Master, func(int) {
+		transitionCh <- Backup2Master
+	})
+
+	done := startRouterLoop(vr)
+	defer stopRouterLoop(t, vr, done)
+
+	vr.packetQueue <- makeAdvertPacket(80, 10, net.IPv4(192, 0, 2, 1))
+	vr.packetQueue <- makeAdvertPacket(120, 10, net.IPv4(192, 0, 2, 2))
+
+	expectNoTransitionBefore(t, transitionCh, 160*time.Millisecond)
+}
+
+func TestBackupDelayedPreemptionCancelsOnTieBreakerLoss(t *testing.T) {
+	vr := newBackupRouterForPreemptDelayTests(10)
+	vr.SetPreemptMode(true)
+	vr.SetPreemptDelay(120 * time.Millisecond)
+
+	transitionCh := make(chan transition, 1)
+	vr.Enroll(Backup2Master, func(int) {
+		transitionCh <- Backup2Master
+	})
+
+	done := startRouterLoop(vr)
+	defer stopRouterLoop(t, vr, done)
+
+	vr.packetQueue <- makeAdvertPacket(80, 10, net.IPv4(192, 0, 2, 1))
+	vr.packetQueue <- makeAdvertPacket(100, 10, net.IPv4(192, 0, 2, 11))
+
+	expectNoTransitionBefore(t, transitionCh, 160*time.Millisecond)
+}
+
+func TestBackupPriorityZeroCancelsDelayAndUsesFastTakeover(t *testing.T) {
+	vr := newBackupRouterForPreemptDelayTests(10)
+	vr.SetPreemptMode(true)
+	vr.SetPreemptDelay(120 * time.Millisecond)
+
+	transitionCh := make(chan transition, 2)
+	vr.Enroll(Backup2Master, func(int) {
+		transitionCh <- Backup2Master
+	})
+
+	done := startRouterLoop(vr)
+	defer stopRouterLoop(t, vr, done)
+
+	vr.packetQueue <- makeAdvertPacket(80, 10, net.IPv4(192, 0, 2, 1))
+	vr.packetQueue <- makeAdvertPacket(0, 10, net.IPv4(192, 0, 2, 2))
+
+	expectNoTransitionBefore(t, transitionCh, 40*time.Millisecond)
+	expectTransition(t, transitionCh, Backup2Master, 100*time.Millisecond)
+	expectNoTransitionBefore(t, transitionCh, 100*time.Millisecond)
+}
+
+func TestEnterFaultClearsDelayedPreemptionState(t *testing.T) {
+	vr := newBackupRouterForPreemptDelayTests(10)
+	vr.SetPreemptMode(true)
+	vr.SetPreemptDelay(120 * time.Millisecond)
+	prearmDelayedPreemption(vr, 200*time.Millisecond)
+
+	transitionCh := make(chan transition, 2)
+	vr.Enroll(Backup2Fault, func(int) {
+		transitionCh <- Backup2Fault
+	})
+	vr.Enroll(Backup2Master, func(int) {
+		transitionCh <- Backup2Master
+	})
+
+	done := startRouterLoop(vr)
+	defer stopRouterLoop(t, vr, done)
+
+	vr.eventChannel <- HEARTBEAT_DOWN
+
+	expectTransition(t, transitionCh, Backup2Fault, 100*time.Millisecond)
+	expectNoTransitionBefore(t, transitionCh, 160*time.Millisecond)
+}
+
+func TestFaultRecoveryDoesNotReusePreviousDelayedPreemptionWindow(t *testing.T) {
+	vr := newBackupRouterForPreemptDelayTests(10)
+	vr.SetPreemptMode(true)
+	vr.SetPreemptDelay(120 * time.Millisecond)
+	prearmDelayedPreemption(vr, 200*time.Millisecond)
+
+	transitionCh := make(chan transition, 3)
+	vr.Enroll(Backup2Fault, func(int) {
+		transitionCh <- Backup2Fault
+	})
+	vr.Enroll(Fault2Backup, func(int) {
+		transitionCh <- Fault2Backup
+	})
+	vr.Enroll(Backup2Master, func(int) {
+		transitionCh <- Backup2Master
+	})
+
+	done := startRouterLoop(vr)
+	defer stopRouterLoop(t, vr, done)
+
+	vr.eventChannel <- HEARTBEAT_DOWN
+
+	expectTransition(t, transitionCh, Backup2Fault, 100*time.Millisecond)
+	vr.eventChannel <- HEARTBEAT_UP
+	expectTransition(t, transitionCh, Fault2Backup, 100*time.Millisecond)
+	expectNoTransitionBefore(t, transitionCh, 250*time.Millisecond)
+}
+
+func TestShutdownClearsDelayedPreemptionState(t *testing.T) {
+	vr := newBackupRouterForPreemptDelayTests(10)
+	vr.SetPreemptMode(true)
+	vr.SetPreemptDelay(120 * time.Millisecond)
+	prearmDelayedPreemption(vr, 200*time.Millisecond)
+
+	done := startRouterLoop(vr)
+	vr.Stop()
+
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("eventSelector did not return after shutdown")
 	}
 
-	// The transition handler confirms takeover timing without racing the router state.
-	// No direct state reads are needed here.
+	if vr.preemptDelayTimer != nil {
+		t.Fatal("expected shutdown to clear delayed-preemption timer")
+	}
+	if vr.preemptPending {
+		t.Fatal("expected shutdown to clear delayed-preemption pending state")
+	}
 }
 
 func TestMakeGratuitousPacketUsesConfiguredOperation(t *testing.T) {
