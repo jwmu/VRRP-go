@@ -143,6 +143,6 @@ var (
 	defaultPreempt                    = true
 	defaultPriority              byte = 100
 	defaultAdvertisementInterval      = 1 * time.Second
-	defaultGARPThrottleInterval       = 5 * time.Millisecond
+	defaultGARPThrottleInterval       = 10 * time.Millisecond
 	defaultGARPSendInterval           = 60
 )
