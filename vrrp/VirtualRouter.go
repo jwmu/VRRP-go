@@ -470,19 +470,22 @@ func (r *VirtualRouter) stopPreemptDelayTimer() {
 	r.preemptPending = false
 }
 
-func (r *VirtualRouter) clearPreemptDelay() {
-	r.stopPreemptDelayTimer()
+func (r *VirtualRouter) backupCanPreemptPacket(packet *VRRPPacket) bool {
+	if !r.preempt || packet.GetPriority() == 0 {
+		return false
+	}
+	return packet.GetPriority() < r.priority || (packet.GetPriority() == r.priority && !largerThan(packet.Pshdr.Saddr, r.preferredSourceIP))
 }
 
 func (r *VirtualRouter) handleBackupPacket(packet *VRRPPacket) bool {
 	if packet.GetPriority() == 0 {
 		logger.GLoger.Printf(logger.INFO, "received an advertisement with priority 0, transit into MASTER state (VRID %v)", r.vrID)
-		r.clearPreemptDelay()
+		r.stopPreemptDelayTimer()
 		//Set the Master_Down_Timer to Skew_Time
 		r.resetMasterDownTimerToSkewTime()
 		return true
 	}
-	if r.preempt && r.preemptDelay > 0 && (packet.GetPriority() < r.priority || (packet.GetPriority() == r.priority && !largerThan(packet.Pshdr.Saddr, r.preferredSourceIP))) {
+	if r.preemptDelay > 0 && r.backupCanPreemptPacket(packet) {
 		r.setMasterAdvInterval(packet.GetAdvertisementInterval())
 		r.resetMasterDownTimer()
 		if !r.preemptPending {
@@ -491,8 +494,8 @@ func (r *VirtualRouter) handleBackupPacket(packet *VRRPPacket) bool {
 		}
 		return false
 	}
-	if r.preempt == false || packet.GetPriority() > r.priority || (packet.GetPriority() == r.priority && largerThan(packet.Pshdr.Saddr, r.preferredSourceIP)) {
-		r.clearPreemptDelay()
+	if !r.preempt || packet.GetPriority() > r.priority || (packet.GetPriority() == r.priority && largerThan(packet.Pshdr.Saddr, r.preferredSourceIP)) {
+		r.stopPreemptDelayTimer()
 		//reset master down timer
 		r.setMasterAdvInterval(packet.GetAdvertisementInterval())
 		r.resetMasterDownTimer()
@@ -508,7 +511,11 @@ func (r *VirtualRouter) drainBackupPackets(blockOnAny bool) bool {
 		select {
 		case packet := <-r.packetQueue:
 			sawPacket = true
-			if blockOnAny || r.handleBackupPacket(packet) {
+			blockedByPacket := r.handleBackupPacket(packet)
+			if !blockedByPacket && blockOnAny && !(r.preemptDelay == 0 && r.backupCanPreemptPacket(packet)) {
+				blockedByPacket = true
+			}
+			if blockedByPacket {
 				blocked = true
 			}
 		default:
@@ -640,7 +647,7 @@ func (r *VirtualRouter) stopStateTimers() {
 		r.stopMasterDownTimer()
 	}
 	if r.preemptDelayTimer != nil || r.preemptPending {
-		r.clearPreemptDelay()
+		r.stopPreemptDelayTimer()
 	}
 	if r.gratuitousArpTimer != nil {
 		r.stopGarpTimer()
@@ -648,7 +655,7 @@ func (r *VirtualRouter) stopStateTimers() {
 }
 
 func (r *VirtualRouter) enterMaster(trans transition) {
-	r.clearPreemptDelay()
+	r.stopPreemptDelayTimer()
 	if r.state != MASTER {
 		if err := r.activateManagedVIPs(); err != nil {
 			logger.GLoger.Printf(logger.ERROR, "VirtualRouter.activateManagedVIPs: %v", err)
@@ -843,6 +850,7 @@ func (r *VirtualRouter) eventSelector() {
 				r.handleBackupPacket(packet)
 			case <-r.masterDownTimer.C: //Master_Down_Timer fired
 				if r.drainBackupPackets(true) {
+					r.resetMasterDownTimer()
 					continue
 				}
 				r.enterMaster(Backup2Master)

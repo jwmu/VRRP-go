@@ -1,6 +1,7 @@
 package vrrp
 
 import (
+	"fmt"
 	"net"
 	"net/netip"
 	"sync"
@@ -308,6 +309,21 @@ func TestBackupPreemptDelayZeroPreservesCurrentTakeoverTiming(t *testing.T) {
 	}
 }
 
+func TestBackupPreemptDelayZeroMasterDownRaceDoesNotResetTakeoverTimer(t *testing.T) {
+	vr := newBackupRouterForPreemptDelayTests(10)
+	vr.SetPreemptMode(true)
+	vr.SetPreemptDelay(0)
+	vr.packetQueue = make(chan *VRRPPacket, 1)
+	vr.packetQueue <- makeAdvertPacket(80, 10, net.IPv4(192, 0, 2, 1))
+
+	if blocked := vr.drainBackupPackets(true); blocked {
+		t.Fatal("expected a queued lower-priority advert to preserve immediate takeover when preemptDelay is zero")
+	}
+	if vr.preemptPending {
+		t.Fatal("expected zero-delay race path to leave preemptPending false")
+	}
+}
+
 func TestBackupDelayedPreemptionWaitsForTimerBeforePromoting(t *testing.T) {
 	vr := newBackupRouterForPreemptDelayTests(10)
 	vr.SetPreemptMode(true)
@@ -466,6 +482,56 @@ func TestBackupPriorityZeroCancelsDelayAndUsesFastTakeover(t *testing.T) {
 	expectNoTransitionBefore(t, transitionCh, 40*time.Millisecond)
 	expectTransition(t, transitionCh, Backup2Master, 100*time.Millisecond)
 	expectNoTransitionBefore(t, transitionCh, 100*time.Millisecond)
+}
+
+// TestBackupImmediatePreemptionSurvivesConcurrentMasterDownAndPacket reproduces
+// the race where masterDownTimer fires at the same instant a lower-priority
+// advertisement arrives in the packet queue.
+//
+// Setup: masterDownTimer is pre-fired (time.NewTimer(0)) and a lower-priority
+// packet is pre-queued before the event loop starts, so both cases are ready
+// simultaneously when eventSelector enters its first BACKUP select.  Go's
+// non-deterministic select means roughly half the iterations pick masterDownTimer
+// first, triggering the drainBackupPackets(true) path.  Over 20 parallel
+// iterations the probability of never hitting that path is < 1-in-a-million.
+//
+// In all cases the router must reach MASTER.  If drainBackupPackets(true) blocks
+// the transition and the consumed masterDownTimer is never reset, the router hangs
+// in BACKUP and the test times out.
+func TestBackupImmediatePreemptionSurvivesConcurrentMasterDownAndPacket(t *testing.T) {
+	for i := range 20 {
+		t.Run(fmt.Sprintf("iter%d", i), func(t *testing.T) {
+			t.Parallel()
+			vr := &VirtualRouter{
+				priority:              100,
+				preempt:               true,
+				preemptDelay:          0,
+				advertisementInterval: 10,
+				ipAddrAnnouncer:       &mockAddrAnnouncer{},
+				iplayerInterface:      &mockIPConnection{},
+				eventChannel:          make(chan EVENT, 1),
+				packetQueue:           make(chan *VRRPPacket, 1),
+				transitionHandler:     make(map[transition]func(int)),
+				stopSignal:            make(chan struct{}),
+				preferredSourceIP:     net.IPv4(192, 0, 2, 10).To16(),
+				protectedIPaddrs:      make(map[[16]byte]*net.Interface),
+			}
+			vr.setMasterAdvInterval(10)
+			vr.state = BACKUP
+			// Pre-fire the timer: its channel already holds a value when the
+			// event loop starts, racing with the pre-queued packet below.
+			vr.masterDownTimer = time.NewTimer(0)
+			vr.packetQueue <- makeAdvertPacket(80, 10, net.IPv4(192, 0, 2, 1))
+
+			transitionCh := make(chan transition, 1)
+			vr.Enroll(Backup2Master, func(int) { transitionCh <- Backup2Master })
+
+			done := startRouterLoop(vr)
+			defer stopRouterLoop(t, vr, done)
+
+			expectTransition(t, transitionCh, Backup2Master, 500*time.Millisecond)
+		})
+	}
 }
 
 func TestEnterFaultClearsDelayedPreemptionState(t *testing.T) {

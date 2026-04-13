@@ -781,6 +781,41 @@ func TestDrainBackupPacketsEmptyQueue(t *testing.T) {
 	}
 }
 
+// TestDrainBackupPacketsBlockOnAnyDoesNotStrandImmediatePreemption is a
+// regression test for the race where masterDownTimer fires at the same instant a
+// lower-priority advertisement lands in the packet queue.
+//
+// When preemptDelay == 0, handleBackupPacket returns false for a lower-priority
+// packet (the masterDownTimer must NOT be reset — we are preempting).
+// drainBackupPackets is called with blockOnAny=true from the masterDownTimer arm
+// of eventSelector.  If it returns true, eventSelector issues a continue, the
+// consumed masterDownTimer is never reset, and the router is permanently stranded
+// in BACKUP.
+func TestDrainBackupPacketsBlockOnAnyDoesNotStrandImmediatePreemption(t *testing.T) {
+	vr := &VirtualRouter{
+		priority:          100,
+		preempt:           true,
+		preemptDelay:      0, // immediate preemption — no delay configured
+		preferredSourceIP: net.IPv4(192, 0, 2, 10).To16(),
+		packetQueue:       make(chan *VRRPPacket, 1),
+	}
+	vr.setMasterAdvInterval(10)
+
+	// Lower-priority advertisement already queued when masterDownTimer fired.
+	// handleBackupPacket returns false here: our priority (100) > master's (80),
+	// so we would preempt immediately and must NOT reset masterDownTimer.
+	vr.packetQueue <- makeAdvertPacket(80, 10, net.IPv4(192, 0, 2, 1))
+
+	// drainBackupPackets(true) must return false so that eventSelector proceeds
+	// to enterMaster.  Returning true causes a continue, leaves the consumed
+	// masterDownTimer unset, and strands the router in BACKUP indefinitely.
+	if vr.drainBackupPackets(true) {
+		t.Fatal("drainBackupPackets(true) returned true for a lower-priority packet " +
+			"in immediate-preemption mode; the consumed masterDownTimer would never be " +
+			"reset, permanently stranding the router in BACKUP")
+	}
+}
+
 func TestHandleBackupPacketPriority0ResetToSkewTime(t *testing.T) {
 	vr := &VirtualRouter{
 		priority:              100,
