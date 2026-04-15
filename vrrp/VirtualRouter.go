@@ -57,6 +57,7 @@ type VirtualRouter struct {
 	gratuitousArpTimer     *time.Timer
 	transitionHandler      map[transition]func(int)
 	stopSignal             chan struct{}
+	done                   chan struct{}
 	shutdownOnce           sync.Once
 	stopRequestOnce        sync.Once
 }
@@ -108,6 +109,7 @@ func NewVirtualRouter(VRID byte, nif string, Owner bool, IPvX byte) (*VirtualRou
 	vr.transitionHandler = make(map[transition]func(int))
 	vr.netlinkOps = systemNetlinkOps{}
 	vr.stopSignal = make(chan struct{})
+	vr.done = make(chan struct{})
 	vr.heartbeatSubscribe = defaultHeartbeatSubscribe
 
 	//find preferred local IP address
@@ -761,6 +763,7 @@ func (r *VirtualRouter) shutdownAll(trans transition) {
 
 // eventSelector VRRP event selector to handle various triggered events
 func (r *VirtualRouter) eventSelector() {
+	defer close(r.done)
 	for {
 		switch r.state {
 		case INIT:
@@ -909,6 +912,7 @@ func (vr *VirtualRouter) Stop() {
 			}()
 		}
 	})
+	<-vr.done
 }
 
 // SetUnicastMode enables or disables unicast mode (RFC 5798)
