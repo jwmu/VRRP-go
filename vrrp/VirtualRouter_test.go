@@ -68,12 +68,11 @@ func makeAdvertPacket(priority byte, adv uint16, src net.IP) *VRRPPacket {
 }
 
 func startRouterLoop(vr *VirtualRouter) chan struct{} {
-	done := make(chan struct{})
-	go func() {
-		vr.eventSelector()
-		close(done)
-	}()
-	return done
+	if vr.done == nil {
+		vr.done = make(chan struct{})
+	}
+	go vr.eventSelector()
+	return vr.done
 }
 
 func prearmDelayedPreemption(vr *VirtualRouter, delay time.Duration) {
@@ -704,18 +703,15 @@ func TestEventSelectorShutdownClosesResourcesAndReturns(t *testing.T) {
 		transitionHandler: make(map[transition]func(int)),
 		masterDownTimer:   timer,
 		stopSignal:        make(chan struct{}),
+		done:              make(chan struct{}),
 	}
 
-	done := make(chan struct{})
-	go func() {
-		vr.eventSelector()
-		close(done)
-	}()
+	go vr.eventSelector()
 
 	vr.eventChannel <- SHUTDOWN
 
 	select {
-	case <-done:
+	case <-vr.done:
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("eventSelector did not return after shutdown")
 	}
@@ -731,12 +727,19 @@ func TestEventSelectorShutdownClosesResourcesAndReturns(t *testing.T) {
 	}
 }
 
-func TestStopIsIdempotentAndNonBlocking(t *testing.T) {
+func TestStopIsIdempotentAndBlocksUntilExit(t *testing.T) {
 	vr := &VirtualRouter{
-		eventChannel: make(chan EVENT, 1),
-		stopSignal:   make(chan struct{}),
+		state:             INIT,
+		eventChannel:      make(chan EVENT, 2),
+		packetQueue:       make(chan *VRRPPacket, 1),
+		stopSignal:        make(chan struct{}),
+		done:              make(chan struct{}),
+		transitionHandler: make(map[transition]func(int)),
+		ipAddrAnnouncer:   &mockAddrAnnouncer{},
+		iplayerInterface:  &mockIPConnection{},
 	}
-	vr.eventChannel <- START
+
+	go vr.eventSelector()
 
 	done := make(chan struct{})
 	go func() {
@@ -747,11 +750,9 @@ func TestStopIsIdempotentAndNonBlocking(t *testing.T) {
 
 	select {
 	case <-done:
-	case <-time.After(200 * time.Millisecond):
-		t.Fatal("Stop blocked when event channel was full")
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("Stop did not return after eventSelector exited")
 	}
-
-	vr.shutdownResources()
 }
 
 func TestHeartbeatDownTransitionsToFaultAndRecoveryReturnsToBackupForNonOwner(t *testing.T) {
@@ -771,17 +772,14 @@ func TestHeartbeatDownTransitionsToFaultAndRecoveryReturnsToBackupForNonOwner(t 
 		transitionHandler:     make(map[transition]func(int)),
 		masterDownTimer:       timer,
 		stopSignal:            make(chan struct{}),
+		done:                  make(chan struct{}),
 		heartbeatInterface:    "eth0",
 		protectedIPaddrs:      make(map[[16]byte]*net.Interface),
 	}
 
 	vr.setHeartbeatStatus(true)
 
-	done := make(chan struct{})
-	go func() {
-		vr.eventSelector()
-		close(done)
-	}()
+	go vr.eventSelector()
 
 	vr.eventChannel <- HEARTBEAT_DOWN
 	time.Sleep(50 * time.Millisecond)
@@ -800,7 +798,7 @@ func TestHeartbeatDownTransitionsToFaultAndRecoveryReturnsToBackupForNonOwner(t 
 
 	vr.eventChannel <- SHUTDOWN
 	select {
-	case <-done:
+	case <-vr.done:
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("eventSelector did not return after shutdown")
 	}
@@ -823,17 +821,14 @@ func TestHeartbeatDownWithMasterOverrideStaysInFaultAndOwnsVIPs(t *testing.T) {
 		transitionHandler:     make(map[transition]func(int)),
 		masterDownTimer:       timer,
 		stopSignal:            make(chan struct{}),
+		done:                  make(chan struct{}),
 		heartbeatInterface:    "eth0",
 		heartbeatDownMaster:   true,
 		protectedIPaddrs:      make(map[[16]byte]*net.Interface),
 	}
 	vr.setHeartbeatStatus(true)
 
-	done := make(chan struct{})
-	go func() {
-		vr.eventSelector()
-		close(done)
-	}()
+	go vr.eventSelector()
 
 	vr.eventChannel <- HEARTBEAT_DOWN
 	time.Sleep(50 * time.Millisecond)
@@ -852,7 +847,7 @@ func TestHeartbeatDownWithMasterOverrideStaysInFaultAndOwnsVIPs(t *testing.T) {
 
 	vr.eventChannel <- SHUTDOWN
 	select {
-	case <-done:
+	case <-vr.done:
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("eventSelector did not return after shutdown")
 	}
@@ -887,6 +882,7 @@ func TestFaultStateIgnoresIncomingAdvertisements(t *testing.T) {
 		packetQueue:           make(chan *VRRPPacket, 1),
 		transitionHandler:     make(map[transition]func(int)),
 		stopSignal:            make(chan struct{}),
+		done:                  make(chan struct{}),
 		heartbeatInterface:    "eth0",
 		protectedIPaddrs:      make(map[[16]byte]*net.Interface),
 	}
@@ -896,11 +892,7 @@ func TestFaultStateIgnoresIncomingAdvertisements(t *testing.T) {
 	packet.SetPriority(200)
 	packet.Pshdr = &PseudoHeader{Saddr: net.IPv4(192, 0, 2, 2).To16()}
 
-	done := make(chan struct{})
-	go func() {
-		vr.eventSelector()
-		close(done)
-	}()
+	go vr.eventSelector()
 
 	vr.packetQueue <- packet
 	time.Sleep(50 * time.Millisecond)
@@ -913,7 +905,7 @@ func TestFaultStateIgnoresIncomingAdvertisements(t *testing.T) {
 
 	vr.eventChannel <- SHUTDOWN
 	select {
-	case <-done:
+	case <-vr.done:
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("eventSelector did not return after shutdown")
 	}
@@ -930,18 +922,15 @@ func TestFaultShutdownDoesNotSendPriorityZeroAdvertisement(t *testing.T) {
 		eventChannel:     make(chan EVENT, 1),
 		packetQueue:      make(chan *VRRPPacket, 1),
 		stopSignal:       make(chan struct{}),
+		done:             make(chan struct{}),
 	}
 
-	done := make(chan struct{})
-	go func() {
-		vr.eventSelector()
-		close(done)
-	}()
+	go vr.eventSelector()
 
 	vr.eventChannel <- SHUTDOWN
 
 	select {
-	case <-done:
+	case <-vr.done:
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("eventSelector did not return after shutdown")
 	}
@@ -966,15 +955,12 @@ func TestHeartbeatUpRecoversOwnerFromFaultToMasterAndSendsAdvert(t *testing.T) {
 		packetQueue:           make(chan *VRRPPacket, 1),
 		transitionHandler:     make(map[transition]func(int)),
 		stopSignal:            make(chan struct{}),
+		done:                  make(chan struct{}),
 		heartbeatInterface:    "eth0",
 		protectedIPaddrs:      make(map[[16]byte]*net.Interface),
 	}
 
-	done := make(chan struct{})
-	go func() {
-		vr.eventSelector()
-		close(done)
-	}()
+	go vr.eventSelector()
 
 	vr.eventChannel <- HEARTBEAT_UP
 	time.Sleep(50 * time.Millisecond)
@@ -988,7 +974,7 @@ func TestHeartbeatUpRecoversOwnerFromFaultToMasterAndSendsAdvert(t *testing.T) {
 
 	vr.eventChannel <- SHUTDOWN
 	select {
-	case <-done:
+	case <-vr.done:
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("eventSelector did not return after shutdown")
 	}

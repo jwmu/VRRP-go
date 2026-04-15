@@ -626,18 +626,15 @@ func TestEventSelectorInitShutdown(t *testing.T) {
 		packetQueue:       make(chan *VRRPPacket, 1),
 		transitionHandler: make(map[transition]func(int)),
 		stopSignal:        make(chan struct{}),
+		done:              make(chan struct{}),
 	}
 
-	done := make(chan struct{})
-	go func() {
-		vr.eventSelector()
-		close(done)
-	}()
+	go vr.eventSelector()
 
 	vr.eventChannel <- SHUTDOWN
 
 	select {
-	case <-done:
+	case <-vr.done:
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("eventSelector did not return after INIT shutdown")
 	}
@@ -660,18 +657,15 @@ func TestEventSelectorMasterShutdownSendsPriority0(t *testing.T) {
 		gratuitousArpTimer:    time.NewTimer(time.Minute),
 		stopSignal:            make(chan struct{}),
 		protectedIPaddrs:      make(map[[16]byte]*net.Interface),
+		done:                  make(chan struct{}),
 	}
 
-	done := make(chan struct{})
-	go func() {
-		vr.eventSelector()
-		close(done)
-	}()
+	go vr.eventSelector()
 
 	vr.eventChannel <- SHUTDOWN
 
 	select {
-	case <-done:
+	case <-vr.done:
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("eventSelector did not return after MASTER shutdown")
 	}
