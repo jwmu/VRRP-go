@@ -2,11 +2,10 @@ package vrrp
 
 import (
 	"fmt"
+	"log/slog"
 	"net"
 	"net/netip"
 	"sync"
-
-	"github.com/jwmu/VRRP-go/logger"
 
 	"github.com/mdlayher/arp"
 	"github.com/mdlayher/ndp"
@@ -136,25 +135,25 @@ func (nd *IPv6AddrAnnouncer) getConnForInterface(iface *net.Interface) (*ndp.Con
 		return nil, fmt.Errorf("IPv6AddrAnnouncer.getConnForInterface: %v", err)
 	}
 	nd.ndpConns[iface.Index] = con
-	logger.GLoger.Printf(logger.INFO, "NDP client initialized, working on %v, source IP %v", iface.Name, ip)
+	getLogger().Info("NDP client initialized", slog.String("interface", iface.Name), slog.Any("source_ip", ip))
 	return con, nil
 }
 
 func (nd *IPv6AddrAnnouncer) AnnounceAll(vr *VirtualRouter) error {
 	for key, iface := range vr.protectedIPaddrs {
 		if iface == nil {
-			logger.GLoger.Printf(logger.ERROR, "IPv6AddrAnnouncer.AnnounceAll: interface missing for IP %v", net.IP(key[:]))
+			getLogger().Error("IPv6 announce failed: interface missing", slog.Any("ip", net.IP(key[:])))
 			return fmt.Errorf("IPv6AddrAnnouncer.AnnounceAll: interface missing for IP %v", net.IP(key[:]))
 		}
 		address := netip.AddrFrom16(key)
 		multicastgroup, errOfParseMulticastGroup := ndp.SolicitedNodeMulticast(address)
 		if errOfParseMulticastGroup != nil {
-			logger.GLoger.Printf(logger.ERROR, "IPv6AddrAnnouncer.AnnounceAll: %v", errOfParseMulticastGroup)
+			getLogger().Error("IPv6 solicited-node multicast calculation failed", slog.Any("ip", net.IP(key[:])), slog.Any("err", errOfParseMulticastGroup))
 			return errOfParseMulticastGroup
 		}
 		conn, err := nd.getConnForInterface(iface)
 		if err != nil {
-			logger.GLoger.Printf(logger.ERROR, "IPv6AddrAnnouncer.AnnounceAll: %v", err)
+			getLogger().Error("IPv6 announcer connection lookup failed", slog.String("interface", iface.Name), slog.Any("ip", net.IP(key[:])), slog.Any("err", err))
 			return err
 		}
 		msg := &ndp.NeighborAdvertisement{
@@ -168,10 +167,10 @@ func (nd *IPv6AddrAnnouncer) AnnounceAll(vr *VirtualRouter) error {
 			},
 		}
 		if errOfWrite := conn.WriteTo(msg, nil, multicastgroup); errOfWrite != nil {
-			logger.GLoger.Printf(logger.ERROR, "IPv6AddrAnnouncer.AnnounceAll: %v", errOfWrite)
+			getLogger().Error("IPv6 neighbor advertisement send failed", slog.String("interface", iface.Name), slog.Any("ip", net.IP(key[:])), slog.Any("multicast_group", multicastgroup), slog.Any("err", errOfWrite))
 			return errOfWrite
 		}
-		logger.GLoger.Printf(logger.INFO, "send unsolicited neighbor advertisement for %v via %s", net.IP(key[:]), iface.Name)
+		getLogger().Info("unsolicited neighbor advertisement sent", slog.Any("ip", net.IP(key[:])), slog.String("interface", iface.Name))
 	}
 
 	return nil
@@ -216,12 +215,12 @@ func (ar *IPv4AddrAnnouncer) makeGratuitousPacket(address netip.Addr, hardwareAd
 func (ar *IPv4AddrAnnouncer) AnnounceAll(vr *VirtualRouter) error {
 	for k, iface := range vr.protectedIPaddrs {
 		if iface == nil {
-			logger.GLoger.Printf(logger.ERROR, "IPv4AddrAnnouncer.AnnounceAll: interface missing for IP %v", net.IP(k[:]))
+			getLogger().Error("IPv4 announce failed: interface missing", slog.Any("ip", net.IP(k[:])))
 			return fmt.Errorf("IPv4AddrAnnouncer.AnnounceAll: interface missing for IP %v", net.IP(k[:]))
 		}
 		sender, err := ar.getSenderForInterface(iface, vr.garpThrottleInterval)
 		if err != nil {
-			logger.GLoger.Printf(logger.ERROR, "IPv4AddrAnnouncer.AnnounceAll: %v", err)
+			getLogger().Error("IPv4 announcer sender lookup failed", slog.String("interface", iface.Name), slog.Any("ip", net.IP(k[:])), slog.Any("err", err))
 			return err
 		}
 
@@ -236,7 +235,7 @@ func (ar *IPv4AddrAnnouncer) AnnounceAll(vr *VirtualRouter) error {
 				return err
 			}
 		}
-		logger.GLoger.Printf(logger.INFO, "send gratuitous %s arp for %v via %s", vr.garpOperation, net.IP(k[:]), iface.Name)
+		getLogger().Info("gratuitous ARP sent", slog.String("operation", vr.garpOperation.String()), slog.Any("ip", net.IP(k[:])), slog.String("interface", iface.Name), slog.Int("repeat", vr.garpMasterRepeat))
 	}
 	return nil
 }
@@ -282,7 +281,7 @@ func (ar *IPv4AddrAnnouncer) getSenderForInterface(iface *net.Interface, throttl
 	if err != nil {
 		return nil, fmt.Errorf("IPv4AddrAnnouncer.getSenderForInterface: %v", err)
 	}
-	logger.GLoger.Printf(logger.DEBUG, "IPv4AddrAnnouncer: initialized ARP client on interface %s", iface.Name)
+	getLogger().Debug("ARP client initialized", slog.String("interface", iface.Name))
 	sender := newARPInterfaceSender(client, throttleInterval)
 
 	ar.mu.Lock()
@@ -290,7 +289,7 @@ func (ar *IPv4AddrAnnouncer) getSenderForInterface(iface *net.Interface, throttl
 		existing.setThrottleInterval(throttleInterval)
 		ar.mu.Unlock()
 		if err := sender.close(); err != nil {
-			logger.GLoger.Printf(logger.ERROR, "IPv4AddrAnnouncer.getSenderForInterface: close redundant sender on %s: %v", iface.Name, err)
+			getLogger().Error("close redundant ARP sender failed", slog.String("interface", iface.Name), slog.Any("err", err))
 		}
 		return existing, nil
 	}
@@ -375,7 +374,7 @@ func ipConnection(local, remote net.IP) (*net.IPConn, error) {
 		}
 
 	}
-	logger.GLoger.Printf(logger.INFO, "IP virtual connection established %v ==> %v", local, remote)
+	getLogger().Info("IP virtual connection established", slog.Any("local", local), slog.Any("remote", remote))
 	return conn, nil
 }
 
@@ -417,7 +416,7 @@ func joinIPv6MulticastGroup(con *net.IPConn, local, remote net.IP) error {
 	if errOfSetMreq := syscall.SetsockoptIPv6Mreq(int(fd.Fd()), syscall.IPPROTO_IPV6, syscall.IPV6_JOIN_GROUP, mreq); errOfSetMreq != nil {
 		return fmt.Errorf("joinIPv6MulticastGroup: %v", errOfSetMreq)
 	}
-	logger.GLoger.Printf(logger.INFO, "Join IPv6 multicast group %v on %v", remote, IF.Name)
+	getLogger().Info("joined IPv6 multicast group", slog.Any("group", remote), slog.String("interface", IF.Name))
 	return nil
 }
 

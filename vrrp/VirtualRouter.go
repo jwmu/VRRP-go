@@ -2,12 +2,18 @@ package vrrp
 
 import (
 	"fmt"
+	"log/slog"
 	"net"
 	"sync"
 	"time"
-
-	"github.com/jwmu/VRRP-go/logger"
 )
+
+func ipVersionName(version byte) string {
+	if version == IPv6 {
+		return "IPv6"
+	}
+	return "IPv4"
+}
 
 type VirtualRouter struct {
 	vrID                          byte
@@ -115,7 +121,7 @@ func NewVirtualRouter(VRID byte, nif string, Owner bool, IPvX byte) (*VirtualRou
 
 	//find preferred local IP address
 	if preferred, err := findIPbyInterface(NetworkInterface, IPvX); err != nil {
-		logger.GLoger.Printf(logger.ERROR, "NewVirtualRouter: %v", err)
+		getLogger().Error("find preferred source IP failed", slog.Uint64("vrid", uint64(VRID)), slog.String("interface", nif), slog.Any("err", err))
 		return nil, err
 	} else {
 		vr.preferredSourceIP = preferred
@@ -141,7 +147,7 @@ func NewVirtualRouter(VRID byte, nif string, Owner bool, IPvX byte) (*VirtualRou
 			}
 		}
 	}
-	logger.GLoger.Printf(logger.INFO, "virtual router %v initialized, working on %v", VRID, nif)
+	getLogger().Info("virtual router initialized", slog.Uint64("vrid", uint64(VRID)), slog.String("interface", nif), slog.String("ip_version", ipVersionName(IPvX)))
 	return vr, nil
 
 }
@@ -197,14 +203,14 @@ func (r *VirtualRouter) SetGratuitousARPOperation(operation GratuitousARPOperati
 	case GratuitousARPRequest, GratuitousARPReply:
 		r.garpOperation = operation
 	default:
-		logger.GLoger.Printf(logger.ERROR, "SetGratuitousARPOperation: unsupported gratuitous ARP operation %d", operation)
+		getLogger().Error("unsupported gratuitous ARP operation", slog.Int("operation", int(operation)))
 	}
 	return r
 }
 
 func (r *VirtualRouter) SetGratuitousARPThrottleInterval(interval time.Duration) *VirtualRouter {
 	if interval < 0 {
-		logger.GLoger.Printf(logger.ERROR, "SetGratuitousARPThrottleInterval: interval must be non-negative")
+		getLogger().Error("gratuitous ARP throttle interval must be non-negative", slog.Duration("interval", interval))
 		return r
 	}
 	r.garpThrottleInterval = interval
@@ -221,15 +227,15 @@ func (r *VirtualRouter) AddIPvXAddr(iface string, ip net.IP) error {
 	copy(key[:], ip.To16())
 	networkIface, err := r.lookupInterface(iface)
 	if err != nil {
-		logger.GLoger.Printf(logger.ERROR, "VirtualRouter.AddIPvXAddr: interface is not found for IP %v", ip)
+		getLogger().Error("associate protected IP failed: interface not found", slog.String("interface", iface), slog.Any("ip", ip), slog.Any("err", err))
 		return err
 	}
 	if _, ok := r.protectedIPaddrs[key]; ok {
-		logger.GLoger.Printf(logger.ERROR, "VirtualRouter.AddIPvXAddr: add redundant IP addr %v", ip)
+		getLogger().Error("associate protected IP skipped: duplicate address", slog.Any("ip", ip), slog.String("interface", networkIface.Name))
 		return nil
 	}
 	r.protectedIPaddrs[key] = networkIface
-	logger.GLoger.Printf(logger.INFO, "VirtualRouter.AddIPvXAddr: IP %v associated with interface %s", ip, networkIface.Name)
+	getLogger().Info("protected IP associated with interface", slog.Any("ip", ip), slog.String("interface", networkIface.Name))
 	return nil
 }
 
@@ -280,9 +286,9 @@ func (r *VirtualRouter) RemoveIPvXAddr(ip net.IP) {
 	copy(key[:], ip)
 	if _, ok := r.protectedIPaddrs[key]; ok {
 		delete(r.protectedIPaddrs, key)
-		logger.GLoger.Printf(logger.INFO, "IP %v removed", ip)
+		getLogger().Info("protected IP removed", slog.Any("ip", ip))
 	} else {
-		logger.GLoger.Printf(logger.ERROR, "VirtualRouter.RemoveIPvXAddr: remove inexistent IP addr %v", ip)
+		getLogger().Error("remove protected IP failed: address not found", slog.Any("ip", ip))
 	}
 }
 
@@ -290,25 +296,21 @@ func (r *VirtualRouter) sendAdvertMessage() {
 	if r.state == FAULT {
 		return
 	}
-	// for k := range r.protectedIPaddrs {
-	// 	logger.GLoger.Printf(logger.DEBUG, "send advert message of IP %v", net.IP(k[:]))
-	// }
-
 	// RFC 5798: In unicast mode, send to all configured peer addresses
 	if r.unicastMode && len(r.unicastPeers) > 0 {
 		for _, peer := range r.unicastPeers {
 			packet := r.assembleVRRPPacketForDestination(peer)
 			if errOfWrite := r.iplayerInterface.WriteMessageTo(packet, peer); errOfWrite != nil {
-				logger.GLoger.Printf(logger.ERROR, "VirtualRouter.WriteMessageTo: failed to send to peer %v: %v", peer, errOfWrite)
+				getLogger().Error("send VRRP advertisement to unicast peer failed", slog.Any("peer", peer), slog.Uint64("vrid", uint64(r.vrID)), slog.Any("err", errOfWrite))
 			} else {
-				logger.GLoger.Printf(logger.DEBUG, "sent VRRP advertisement to unicast peer %v", peer)
+				getLogger().Debug("sent VRRP advertisement to unicast peer", slog.Any("peer", peer), slog.Uint64("vrid", uint64(r.vrID)))
 			}
 		}
 	} else {
 		packet := r.assembleVRRPPacket()
 		// Multicast mode (default)
 		if errOfWrite := r.iplayerInterface.WriteMessage(packet); errOfWrite != nil {
-			logger.GLoger.Printf(logger.ERROR, "VirtualRouter.WriteMessage: %v", errOfWrite)
+			getLogger().Error("send VRRP advertisement failed", slog.Uint64("vrid", uint64(r.vrID)), slog.Any("err", errOfWrite))
 		}
 	}
 }
@@ -350,18 +352,18 @@ func (r *VirtualRouter) fetchVRRPPacket() {
 			if r.isStopping() {
 				return
 			}
-			logger.GLoger.Printf(logger.ERROR, "VirtualRouter.fetchVRRPPacket: %v", errofFetch)
+			getLogger().Error("read VRRP packet failed", slog.Uint64("vrid", uint64(r.vrID)), slog.Any("err", errofFetch))
 		} else {
 			// Verify VRID matches
 			if r.vrID != packet.GetVirtualRouterID() {
-				logger.GLoger.Printf(logger.ERROR, "VirtualRouter.fetchVRRPPacket: received a advertisement with different ID: %v", packet.GetVirtualRouterID())
+				getLogger().Error("received advertisement for different VRID", slog.Uint64("expected_vrid", uint64(r.vrID)), slog.Uint64("received_vrid", uint64(packet.GetVirtualRouterID())))
 				continue
 			}
 
 			// RFC 5798: In unicast mode, verify that the packet is from a configured peer
 			if r.unicastMode && len(r.unicastPeers) > 0 {
 				if packet.Pshdr == nil {
-					logger.GLoger.Printf(logger.ERROR, "VirtualRouter.fetchVRRPPacket: packet missing pseudo header")
+					getLogger().Error("received unicast VRRP packet without pseudo header", slog.Uint64("vrid", uint64(r.vrID)))
 					continue
 				}
 				senderIP := packet.Pshdr.Saddr
@@ -373,7 +375,7 @@ func (r *VirtualRouter) fetchVRRPPacket() {
 					}
 				}
 				if !peerFound {
-					logger.GLoger.Printf(logger.DEBUG, "VirtualRouter.fetchVRRPPacket: received packet from non-peer address %v in unicast mode, ignoring", senderIP)
+					getLogger().Debug("ignored VRRP packet from non-peer address in unicast mode", slog.Any("sender_ip", senderIP), slog.Uint64("vrid", uint64(r.vrID)))
 					continue
 				}
 			}
@@ -383,7 +385,6 @@ func (r *VirtualRouter) fetchVRRPPacket() {
 			case <-r.stopSignal:
 				return
 			}
-			//logger.GLoger.Printf(logger.DEBUG, "VirtualRouter.fetchVRRPPacket: received one advertisement")
 		}
 	}
 }
@@ -411,7 +412,7 @@ func (r *VirtualRouter) stopMasterDownTimer() {
 	if r.masterDownTimer == nil {
 		return
 	}
-	logger.GLoger.Printf(logger.DEBUG, "master down timer stopped")
+	getLogger().Debug("master down timer stopped", slog.Uint64("vrid", uint64(r.vrID)))
 	// IMPORTANT: Stop() must be paired with selective drain of C to prevent
 	// channel leakage or stale firing if the timer already expired.
 	if !r.masterDownTimer.Stop() {
@@ -419,7 +420,7 @@ func (r *VirtualRouter) stopMasterDownTimer() {
 		case <-r.masterDownTimer.C:
 		default:
 		}
-		logger.GLoger.Printf(logger.DEBUG, "master down timer expired before we stop it, drain the channel")
+		getLogger().Debug("master down timer already expired before stop", slog.Uint64("vrid", uint64(r.vrID)))
 	}
 }
 
@@ -482,7 +483,7 @@ func (r *VirtualRouter) backupCanPreemptPacket(packet *VRRPPacket) bool {
 
 func (r *VirtualRouter) handleBackupPacket(packet *VRRPPacket) bool {
 	if packet.GetPriority() == 0 {
-		logger.GLoger.Printf(logger.INFO, "received an advertisement with priority 0, transit into MASTER state (VRID %v)", r.vrID)
+		getLogger().Info("received priority-0 advertisement; transitioning toward master", slog.Uint64("vrid", uint64(r.vrID)))
 		r.stopPreemptDelayTimer()
 		//Set the Master_Down_Timer to Skew_Time
 		r.resetMasterDownTimerToSkewTime()
@@ -556,11 +557,11 @@ func (r *VirtualRouter) Enroll(transition2 transition, handler func(int)) bool {
 	r.handlerLock.Lock()
 	defer r.handlerLock.Unlock()
 	if _, ok := r.transitionHandler[transition2]; ok {
-		logger.GLoger.Printf(logger.INFO, fmt.Sprintf("VirtualRouter.Enroll(): handler of transition [%s] overwrited", transition2))
+		getLogger().Info("transition handler overwritten", slog.String("transition", transition2.String()))
 		r.transitionHandler[transition2] = handler
 		return true
 	}
-	logger.GLoger.Printf(logger.INFO, fmt.Sprintf("VirtualRouter.Enroll(): handler of transition [%s] enrolled", transition2))
+	getLogger().Info("transition handler enrolled", slog.String("transition", transition2.String()))
 	r.transitionHandler[transition2] = handler
 	return false
 }
@@ -569,7 +570,7 @@ func (r *VirtualRouter) ClearTransitionHandler() {
 	r.handlerLock.Lock()
 	defer r.handlerLock.Unlock()
 	r.transitionHandler = make(map[transition]func(int))
-	logger.GLoger.Printf(logger.INFO, "VirtualRouter.ClearTransitionHandler(): all transition handlers cleared")
+	getLogger().Info("all transition handlers cleared", slog.Uint64("vrid", uint64(r.vrID)))
 }
 
 func (r *VirtualRouter) transitionDoWork(t transition) {
@@ -581,7 +582,7 @@ func (r *VirtualRouter) transitionDoWork(t transition) {
 		return
 	}
 	work(r.state)
-	logger.GLoger.Printf(logger.INFO, fmt.Sprintf("handler of transition [%s] called", t))
+	getLogger().Info("transition handler called", slog.String("transition", t.String()), slog.Int("state", r.state))
 }
 
 func (r *VirtualRouter) closeAnnouncer() {
@@ -589,7 +590,7 @@ func (r *VirtualRouter) closeAnnouncer() {
 		return
 	}
 	if err := r.ipAddrAnnouncer.Close(); err != nil {
-		logger.GLoger.Printf(logger.ERROR, "VirtualRouter.closeAnnouncer: %v", err)
+		getLogger().Error("close address announcer failed", slog.Uint64("vrid", uint64(r.vrID)), slog.Any("err", err))
 	}
 }
 
@@ -598,7 +599,7 @@ func (r *VirtualRouter) closeIPConnection() {
 		return
 	}
 	if err := r.iplayerInterface.Close(); err != nil {
-		logger.GLoger.Printf(logger.ERROR, "VirtualRouter.closeIPConnection: %v", err)
+		getLogger().Error("close IP connection failed", slog.Uint64("vrid", uint64(r.vrID)), slog.Any("err", err))
 	}
 }
 
@@ -627,7 +628,7 @@ func (r *VirtualRouter) sendEvent(event EVENT) {
 func (r *VirtualRouter) monitorHeartbeat() {
 	updates := make(chan heartbeatLinkUpdate, 8)
 	if err := r.heartbeatSubscribe(r.heartbeatInterface, r.ipvX, updates, r.stopSignal); err != nil {
-		logger.GLoger.Printf(logger.ERROR, "VirtualRouter.monitorHeartbeat: %v", err)
+		getLogger().Error("subscribe heartbeat updates failed", slog.String("interface", r.heartbeatInterface), slog.Any("err", err))
 		return
 	}
 	r.setHeartbeatStatus(r.checkHeartbeatInterface())
@@ -672,13 +673,13 @@ func (r *VirtualRouter) enterMaster(trans transition) {
 	r.stopPreemptDelayTimer()
 	if r.state != MASTER {
 		if err := r.activateManagedVIPs(); err != nil {
-			logger.GLoger.Printf(logger.ERROR, "VirtualRouter.activateManagedVIPs: %v", err)
+			getLogger().Error("activate managed VIPs failed", slog.Uint64("vrid", uint64(r.vrID)), slog.Any("err", err))
 		}
 	}
 	r.state = MASTER
 	r.sendAdvertMessage()
 	if errOfarp := r.ipAddrAnnouncer.AnnounceAll(r); errOfarp != nil {
-		logger.GLoger.Printf(logger.ERROR, "VirtualRouter.EventLoop: %v", errOfarp)
+		getLogger().Error("announce all VIPs failed while entering master", slog.Uint64("vrid", uint64(r.vrID)), slog.Any("err", errOfarp))
 	}
 	if r.advertisementTicker == nil {
 		r.makeAdvertTicker()
@@ -694,7 +695,7 @@ func (r *VirtualRouter) enterMaster(trans transition) {
 
 func (r *VirtualRouter) enterBackup(trans transition, startTimer bool) {
 	if err := r.deactivateManagedVIPs(); err != nil {
-		logger.GLoger.Printf(logger.ERROR, "VirtualRouter.deactivateManagedVIPs: %v", err)
+		getLogger().Error("deactivate managed VIPs failed", slog.Uint64("vrid", uint64(r.vrID)), slog.Any("err", err))
 	}
 	r.stopStateTimers()
 	r.setMasterAdvInterval(r.advertisementInterval)
@@ -713,16 +714,16 @@ func (r *VirtualRouter) enterFault(trans transition) {
 		r.faultOwnsVIPs = true
 		if trans != Master2Fault {
 			if err := r.activateManagedVIPs(); err != nil {
-				logger.GLoger.Printf(logger.ERROR, "VirtualRouter.activateManagedVIPs: %v", err)
+				getLogger().Error("activate managed VIPs failed while entering fault", slog.Uint64("vrid", uint64(r.vrID)), slog.Any("err", err))
 			}
 			if err := r.ipAddrAnnouncer.AnnounceAll(r); err != nil {
-				logger.GLoger.Printf(logger.ERROR, "VirtualRouter.enterFault: %v", err)
+				getLogger().Error("announce all VIPs failed while entering fault", slog.Uint64("vrid", uint64(r.vrID)), slog.Any("err", err))
 			}
 		}
 	} else {
 		r.faultOwnsVIPs = false
 		if err := r.deactivateManagedVIPs(); err != nil {
-			logger.GLoger.Printf(logger.ERROR, "VirtualRouter.deactivateManagedVIPs: %v", err)
+			getLogger().Error("deactivate managed VIPs failed while entering fault", slog.Uint64("vrid", uint64(r.vrID)), slog.Any("err", err))
 		}
 	}
 	r.state = FAULT
@@ -736,12 +737,12 @@ func (r *VirtualRouter) shutdownResources() {
 		close(r.stopSignal)
 		r.stopStateTimers()
 		if err := r.deactivateManagedVIPs(); err != nil {
-			logger.GLoger.Printf(logger.ERROR, "VirtualRouter.shutdownResources deactivate VIPs: %v", err)
+			getLogger().Error("deactivate managed VIPs failed during shutdown", slog.Uint64("vrid", uint64(r.vrID)), slog.Any("err", err))
 		}
 		r.closeAnnouncer()
 		r.closeIPConnection()
 		if err := r.destroyManagedVMACs(); err != nil {
-			logger.GLoger.Printf(logger.ERROR, "VirtualRouter.shutdownResources destroy VMACs: %v", err)
+			getLogger().Error("destroy managed VMACs failed during shutdown", slog.Uint64("vrid", uint64(r.vrID)), slog.Any("err", err))
 		}
 	})
 }
@@ -749,7 +750,7 @@ func (r *VirtualRouter) shutdownResources() {
 // ///////////////////////////////////////
 func largerThan(ip1, ip2 net.IP) bool {
 	if len(ip1) != len(ip2) {
-		logger.GLoger.Printf(logger.ERROR, "largerThan: two compared IP addresses must have the same length")
+		getLogger().Error("compare IP addresses failed: length mismatch", slog.Int("left_len", len(ip1)), slog.Int("right_len", len(ip2)))
 		return false
 	}
 	for index := range ip1 {
@@ -776,35 +777,33 @@ func (r *VirtualRouter) eventSelector() {
 	for {
 		switch r.state {
 		case INIT:
-			select {
-			case event := <-r.eventChannel:
-				switch event {
-				case SHUTDOWN:
-					r.shutdownResources()
-					return
-				case HEARTBEAT_DOWN:
-					logger.GLoger.Printf(logger.INFO, "heartbeat interface %s down", r.heartbeatInterface)
+			event := <-r.eventChannel
+			switch event {
+			case SHUTDOWN:
+				r.shutdownResources()
+				return
+			case HEARTBEAT_DOWN:
+				getLogger().Info("heartbeat interface down", slog.String("interface", r.heartbeatInterface), slog.Uint64("vrid", uint64(r.vrID)))
+				r.enterFault(Init2Fault)
+			case START:
+				getLogger().Info("event received", slog.String("event", event.String()), slog.Int("state", r.state), slog.Uint64("vrid", uint64(r.vrID)))
+				if !r.isHeartbeatUp() {
 					r.enterFault(Init2Fault)
-				case START:
-					logger.GLoger.Printf(logger.INFO, "event %v received", event)
-					if !r.isHeartbeatUp() {
-						r.enterFault(Init2Fault)
-						continue
-					}
-					if r.priority == 255 || r.owner {
-						logger.GLoger.Printf(logger.INFO, "enter owner mode")
-						r.enterMaster(Init2Master)
-						continue
-					}
-					logger.GLoger.Printf(logger.INFO, "VR is not the owner of protected IP addresses")
-					r.enterBackup(Init2Backup, true)
+					continue
 				}
+				if r.priority == 255 || r.owner {
+					getLogger().Info("enter owner mode", slog.Uint64("vrid", uint64(r.vrID)))
+					r.enterMaster(Init2Master)
+					continue
+				}
+				getLogger().Info("router is not the owner of protected IP addresses", slog.Uint64("vrid", uint64(r.vrID)))
+				r.enterBackup(Init2Backup, true)
 			}
 		case MASTER:
 			//check if shutdown event received
 			select {
 			case event := <-r.eventChannel:
-				logger.GLoger.Printf(logger.INFO, "event %v received", event)
+				getLogger().Info("event received", slog.String("event", event.String()), slog.Int("state", r.state), slog.Uint64("vrid", uint64(r.vrID)))
 				if event == SHUTDOWN {
 					//send advertisement with priority 0
 					priority := r.priority
@@ -815,14 +814,14 @@ func (r *VirtualRouter) eventSelector() {
 					return
 				}
 				if event == HEARTBEAT_DOWN {
-					logger.GLoger.Printf(logger.INFO, "heartbeat interface %s down", r.heartbeatInterface)
+					getLogger().Info("heartbeat interface down", slog.String("interface", r.heartbeatInterface), slog.Uint64("vrid", uint64(r.vrID)))
 					r.enterFault(Master2Fault)
 				}
 			case <-r.advertisementTicker.C: //check if advertisement timer fired
 				r.sendAdvertMessage()
 			case <-r.gratuitousArpTimer.C:
 				if err := r.ipAddrAnnouncer.AnnounceAll(r); err != nil {
-					logger.GLoger.Printf(logger.ERROR, "VirtualRouter.EventLoop: %v", err)
+					getLogger().Error("announce all VIPs failed from master event loop", slog.Uint64("vrid", uint64(r.vrID)), slog.Any("err", err))
 				}
 				r.resetGarpTimer(r.garpMasterSendInterval)
 			case packet := <-r.packetQueue: //process incoming advertisement
@@ -834,7 +833,7 @@ func (r *VirtualRouter) eventSelector() {
 					r.makeMasterDownTimer()
 					r.sendAdvertMessage()
 					if err := r.deactivateManagedVIPs(); err != nil {
-						logger.GLoger.Printf(logger.ERROR, "VirtualRouter.deactivateManagedVIPs: %v", err)
+						getLogger().Error("deactivate managed VIPs failed after master demotion", slog.Uint64("vrid", uint64(r.vrID)), slog.Any("err", err))
 					}
 					r.state = BACKUP
 					r.transitionDoWork(Master2Backup)
@@ -850,11 +849,11 @@ func (r *VirtualRouter) eventSelector() {
 			case event := <-r.eventChannel:
 				if event == SHUTDOWN {
 					r.shutdownAll(Backup2Init)
-					logger.GLoger.Printf(logger.INFO, "event %s received", event)
+					getLogger().Info("event received", slog.String("event", event.String()), slog.Int("state", r.state), slog.Uint64("vrid", uint64(r.vrID)))
 					return
 				}
 				if event == HEARTBEAT_DOWN {
-					logger.GLoger.Printf(logger.INFO, "heartbeat interface %s down", r.heartbeatInterface)
+					getLogger().Info("heartbeat interface down", slog.String("interface", r.heartbeatInterface), slog.Uint64("vrid", uint64(r.vrID)))
 					r.enterFault(Backup2Fault)
 				}
 			case packet := <-r.packetQueue: //process incoming advertisement
@@ -883,11 +882,11 @@ func (r *VirtualRouter) eventSelector() {
 				if event == HEARTBEAT_UP {
 					r.faultOwnsVIPs = false
 					if r.priority == 255 || r.owner {
-						logger.GLoger.Printf(logger.INFO, "enter owner mode")
+						getLogger().Info("enter owner mode", slog.Uint64("vrid", uint64(r.vrID)))
 						r.enterMaster(Fault2Master)
 						continue
 					}
-					logger.GLoger.Printf(logger.INFO, "VR is not the owner of protected IP addresses")
+					getLogger().Info("router is not the owner of protected IP addresses", slog.Uint64("vrid", uint64(r.vrID)))
 					r.enterBackup(Fault2Backup, true)
 				}
 			case <-r.packetQueue:
@@ -928,14 +927,14 @@ func (vr *VirtualRouter) Stop() {
 // instead of the multicast address.SetUnicastMode must be called before StartWithEventSelector
 func (vr *VirtualRouter) SetUnicastMode(enabled bool) *VirtualRouter {
 	if len(vr.unicastPeers) == 0 && enabled {
-		logger.GLoger.Printf(logger.ERROR, "SetUnicastMode: no unicast peers configured")
+		getLogger().Error("enable unicast mode failed: no peers configured", slog.Uint64("vrid", uint64(vr.vrID)))
 		return vr
 	}
 	vr.unicastMode = enabled
 	if enabled {
-		logger.GLoger.Printf(logger.INFO, "unicast mode enabled for virtual router %v", vr.vrID)
+		getLogger().Info("unicast mode enabled", slog.Uint64("vrid", uint64(vr.vrID)), slog.Int("peer_count", len(vr.unicastPeers)))
 	} else {
-		logger.GLoger.Printf(logger.INFO, "unicast mode disabled (multicast mode) for virtual router %v", vr.vrID)
+		getLogger().Info("unicast mode disabled; multicast mode active", slog.Uint64("vrid", uint64(vr.vrID)))
 	}
 	var err error
 	if vr.ipvX == IPv4 {
@@ -954,7 +953,7 @@ func (vr *VirtualRouter) SetUnicastMode(enabled bool) *VirtualRouter {
 		}
 	}
 	if err != nil {
-		logger.GLoger.Printf(logger.ERROR, "SetUnicastMode: failed to recreate IP connection: %v", err)
+		getLogger().Error("recreate IP connection for unicast mode failed", slog.Uint64("vrid", uint64(vr.vrID)), slog.Bool("enabled", enabled), slog.Any("err", err))
 	}
 	return vr
 }
@@ -970,24 +969,24 @@ func (vr *VirtualRouter) IsUnicastMode() bool {
 func (vr *VirtualRouter) AddUnicastPeer(peer net.IP) *VirtualRouter {
 	// Validate that peer address matches the IP version
 	if vr.ipvX == IPv4 && peer.To4() == nil {
-		logger.GLoger.Printf(logger.ERROR, "AddUnicastPeer: IPv4 virtual router cannot have IPv6 peer %v", peer)
+		getLogger().Error("add unicast peer failed: IPv6 peer on IPv4 router", slog.Any("peer", peer), slog.Uint64("vrid", uint64(vr.vrID)))
 		return vr
 	}
 	if vr.ipvX == IPv6 && peer.To4() != nil {
-		logger.GLoger.Printf(logger.ERROR, "AddUnicastPeer: IPv6 virtual router cannot have IPv4 peer %v", peer)
+		getLogger().Error("add unicast peer failed: IPv4 peer on IPv6 router", slog.Any("peer", peer), slog.Uint64("vrid", uint64(vr.vrID)))
 		return vr
 	}
 
 	// Check if peer already exists
 	for _, existingPeer := range vr.unicastPeers {
 		if existingPeer.Equal(peer) {
-			logger.GLoger.Printf(logger.DEBUG, "AddUnicastPeer: peer %v already exists", peer)
+			getLogger().Debug("unicast peer already exists", slog.Any("peer", peer), slog.Uint64("vrid", uint64(vr.vrID)))
 			return vr
 		}
 	}
 
 	vr.unicastPeers = append(vr.unicastPeers, peer)
-	logger.GLoger.Printf(logger.INFO, "unicast peer %v added to virtual router %v", peer, vr.vrID)
+	getLogger().Info("unicast peer added", slog.Any("peer", peer), slog.Uint64("vrid", uint64(vr.vrID)), slog.Int("peer_count", len(vr.unicastPeers)))
 	return vr
 }
 
@@ -996,18 +995,18 @@ func (vr *VirtualRouter) RemoveUnicastPeer(peer net.IP) *VirtualRouter {
 	for i, existingPeer := range vr.unicastPeers {
 		if existingPeer.Equal(peer) {
 			vr.unicastPeers = append(vr.unicastPeers[:i], vr.unicastPeers[i+1:]...)
-			logger.GLoger.Printf(logger.INFO, "unicast peer %v removed from virtual router %v", peer, vr.vrID)
+			getLogger().Info("unicast peer removed", slog.Any("peer", peer), slog.Uint64("vrid", uint64(vr.vrID)), slog.Int("peer_count", len(vr.unicastPeers)))
 			return vr
 		}
 	}
-	logger.GLoger.Printf(logger.ERROR, "RemoveUnicastPeer: peer %v not found", peer)
+	getLogger().Error("remove unicast peer failed: peer not found", slog.Any("peer", peer), slog.Uint64("vrid", uint64(vr.vrID)))
 	return vr
 }
 
 // ClearUnicastPeers removes all unicast peer addresses
 func (vr *VirtualRouter) ClearUnicastPeers() *VirtualRouter {
 	vr.unicastPeers = make([]net.IP, 0)
-	logger.GLoger.Printf(logger.INFO, "all unicast peers cleared for virtual router %v", vr.vrID)
+	getLogger().Info("all unicast peers cleared", slog.Uint64("vrid", uint64(vr.vrID)))
 	return vr
 }
 

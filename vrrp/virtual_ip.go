@@ -3,10 +3,10 @@ package vrrp
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"strings"
 
-	"github.com/jwmu/VRRP-go/logger"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 )
@@ -54,7 +54,7 @@ func (systemNetlinkOps) ParseAddr(cidr string) (*netlink.Addr, error) { return n
 
 func (r *VirtualRouter) SetUseVMAC(enabled bool) *VirtualRouter {
 	if len(r.managedVIPs) > 0 {
-		logger.GLoger.Printf(logger.ERROR, "SetUseVMAC: must be called before AddVirtualIP")
+		getLogger().Error("set use VMAC rejected", slog.Bool("enabled", enabled), slog.String("reason", "must be called before AddVirtualIP"))
 		return r
 	}
 	r.useVMAC = enabled
@@ -197,7 +197,7 @@ func createMacvlanInterface(ops netlinkOps, name, parent string, mac net.Hardwar
 	existingLink, err := ops.LinkByName(name)
 	if err == nil {
 		if err := ops.LinkDel(existingLink); err != nil {
-			logger.GLoger.Printf(logger.ERROR, "createMacvlanInterface: failed to delete existing interface %s: %v", name, err)
+			getLogger().Error("delete existing macvlan interface failed", slog.String("name", name), slog.Any("err", err))
 		}
 	}
 
