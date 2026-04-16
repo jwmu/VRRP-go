@@ -56,6 +56,7 @@ type VirtualRouter struct {
 	masterDownTimer        *time.Timer
 	gratuitousArpTimer     *time.Timer
 	transitionHandler      map[transition]func(int)
+	handlerLock            sync.RWMutex
 	stopSignal             chan struct{}
 	done                   chan struct{}
 	shutdownOnce           sync.Once
@@ -96,7 +97,7 @@ func NewVirtualRouter(VRID byte, nif string, Owner bool, IPvX byte) (*VirtualRou
 	vr.SetAdvInterval(defaultAdvertisementInterval)
 	vr.SetPriorityAndMasterAdvInterval(defaultPriority, defaultAdvertisementInterval)
 	vr.garpMasterRepeat = 5
-	vr.garpMasterDelay = 3 //12
+	vr.garpMasterDelay = 3
 	vr.garpMasterSendInterval = defaultGARPSendInterval
 	vr.garpThrottleInterval = defaultGARPThrottleInterval
 	//make
@@ -552,6 +553,8 @@ func (r *VirtualRouter) stopGarpTimer() {
 }
 
 func (r *VirtualRouter) Enroll(transition2 transition, handler func(int)) bool {
+	r.handlerLock.Lock()
+	defer r.handlerLock.Unlock()
 	if _, ok := r.transitionHandler[transition2]; ok {
 		logger.GLoger.Printf(logger.INFO, fmt.Sprintf("VirtualRouter.Enroll(): handler of transition [%s] overwrited", transition2))
 		r.transitionHandler[transition2] = handler
@@ -562,8 +565,17 @@ func (r *VirtualRouter) Enroll(transition2 transition, handler func(int)) bool {
 	return false
 }
 
+func (r *VirtualRouter) ClearTransitionHandler() {
+	r.handlerLock.Lock()
+	defer r.handlerLock.Unlock()
+	r.transitionHandler = make(map[transition]func(int))
+	logger.GLoger.Printf(logger.INFO, "VirtualRouter.ClearTransitionHandler(): all transition handlers cleared")
+}
+
 func (r *VirtualRouter) transitionDoWork(t transition) {
+	r.handlerLock.RLock()
 	var work, ok = r.transitionHandler[t]
+	r.handlerLock.RUnlock()
 	if ok == false {
 		//return fmt.Errorf("VirtualRouter.transitionDoWork(): handler of [%s] does not exist", t)
 		return
