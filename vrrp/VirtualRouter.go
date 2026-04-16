@@ -763,9 +763,6 @@ func largerThan(ip1, ip2 net.IP) bool {
 }
 
 func (r *VirtualRouter) shutdownAll(trans transition) {
-	if err := r.deactivateManagedVIPs(); err != nil {
-		logger.GLoger.Printf(logger.ERROR, "VirtualRouter.deactivateManagedVIPs: %v", err)
-	}
 	r.shutdownResources()
 	r.state = INIT
 	if trans >= 0 {
@@ -807,15 +804,14 @@ func (r *VirtualRouter) eventSelector() {
 			//check if shutdown event received
 			select {
 			case event := <-r.eventChannel:
+				logger.GLoger.Printf(logger.INFO, "event %v received", event)
 				if event == SHUTDOWN {
 					//send advertisement with priority 0
 					priority := r.priority
 					r.SetPriority(0)
 					r.sendAdvertMessage()
 					r.SetPriority(priority)
-
 					r.shutdownAll(Master2Init)
-					logger.GLoger.Printf(logger.INFO, "event %v received", event)
 					return
 				}
 				if event == HEARTBEAT_DOWN {
