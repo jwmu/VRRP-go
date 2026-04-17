@@ -318,6 +318,21 @@ type IPv6Con struct {
 	closeOnce sync.Once
 }
 
+func controlIPConn(conn *net.IPConn, control func(fd uintptr) error) error {
+	rawConn, err := conn.SyscallConn()
+	if err != nil {
+		return err
+	}
+
+	var controlErr error
+	if err := rawConn.Control(func(fd uintptr) {
+		controlErr = control(fd)
+	}); err != nil {
+		return err
+	}
+	return controlErr
+}
+
 func ipConnection(local, remote net.IP) (*net.IPConn, error) {
 
 	var conn *net.IPConn
@@ -336,43 +351,47 @@ func ipConnection(local, remote net.IP) (*net.IPConn, error) {
 	if errOfListenIP != nil {
 		return nil, errOfListenIP
 	}
-	var fd, errOfGetFD = conn.File()
-	if errOfGetFD != nil {
-		return nil, errOfGetFD
-	}
-	defer fd.Close()
 	if remote.To4() != nil {
 		//IPv4 mode
-		//set hop limit
-		if errOfSetHopLimit := syscall.SetsockoptInt(int(fd.Fd()), syscall.IPPROTO_IP, syscall.IP_MULTICAST_TTL, VRRPMultiTTL); errOfSetHopLimit != nil {
-			return nil, fmt.Errorf("ipConnection: %v", errOfSetHopLimit)
-		}
-		//set tos
-		if errOfSetTOS := syscall.SetsockoptInt(int(fd.Fd()), syscall.IPPROTO_IP, syscall.IP_TOS, 7); errOfSetTOS != nil {
-			return nil, fmt.Errorf("ipConnection: %v", errOfSetTOS)
-		}
-		//disable multicast loop
-		if errOfSetLoop := syscall.SetsockoptInt(int(fd.Fd()), syscall.IPPROTO_IP, syscall.IP_MULTICAST_LOOP, 0); errOfSetLoop != nil {
-			return nil, fmt.Errorf("ipConnection: %v", errOfSetLoop)
+		if err := controlIPConn(conn, func(fd uintptr) error {
+			//set hop limit
+			if errOfSetHopLimit := syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IP, syscall.IP_MULTICAST_TTL, VRRPMultiTTL); errOfSetHopLimit != nil {
+				return fmt.Errorf("ipConnection: %v", errOfSetHopLimit)
+			}
+			//set tos
+			if errOfSetTOS := syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IP, syscall.IP_TOS, 7); errOfSetTOS != nil {
+				return fmt.Errorf("ipConnection: %v", errOfSetTOS)
+			}
+			//disable multicast loop
+			if errOfSetLoop := syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IP, syscall.IP_MULTICAST_LOOP, 0); errOfSetLoop != nil {
+				return fmt.Errorf("ipConnection: %v", errOfSetLoop)
+			}
+			return nil
+		}); err != nil {
+			return nil, err
 		}
 	} else {
 		//IPv6 mode
-		//set hop limit
-		if errOfSetHOPLimit := syscall.SetsockoptInt(int(fd.Fd()), syscall.IPPROTO_IPV6, syscall.IPV6_MULTICAST_HOPS, 255); errOfSetHOPLimit != nil {
-			return nil, fmt.Errorf("ipConnection: %v", errOfSetHOPLimit)
+		if err := controlIPConn(conn, func(fd uintptr) error {
+			//set hop limit
+			if errOfSetHOPLimit := syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IPV6, syscall.IPV6_MULTICAST_HOPS, 255); errOfSetHOPLimit != nil {
+				return fmt.Errorf("ipConnection: %v", errOfSetHOPLimit)
+			}
+			//disable multicast loop
+			if errOfSetLoop := syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IPV6, syscall.IPV6_MULTICAST_LOOP, 0); errOfSetLoop != nil {
+				return fmt.Errorf("ipConnection: %v", errOfSetLoop)
+			}
+			//to receive the hop limit and dst address in oob
+			if err := syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IPV6, syscall.IPV6_2292HOPLIMIT, 1); err != nil {
+				return fmt.Errorf("ipConnection: %v", err)
+			}
+			if err := syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IPV6, syscall.IPV6_2292PKTINFO, 1); err != nil {
+				return fmt.Errorf("ipConnection: %v", err)
+			}
+			return nil
+		}); err != nil {
+			return nil, err
 		}
-		//disable multicast loop
-		if errOfSetLoop := syscall.SetsockoptInt(int(fd.Fd()), syscall.IPPROTO_IPV6, syscall.IPV6_MULTICAST_LOOP, 0); errOfSetLoop != nil {
-			return nil, fmt.Errorf("ipConnection: %v", errOfSetLoop)
-		}
-		//to receive the hop limit and dst address in oob
-		if err := syscall.SetsockoptInt(int(fd.Fd()), syscall.IPPROTO_IPV6, syscall.IPV6_2292HOPLIMIT, 1); err != nil {
-			return nil, fmt.Errorf("ipConnection: %v", err)
-		}
-		if err := syscall.SetsockoptInt(int(fd.Fd()), syscall.IPPROTO_IPV6, syscall.IPV6_2292PKTINFO, 1); err != nil {
-			return nil, fmt.Errorf("ipConnection: %v", err)
-		}
-
 	}
 	getLogger().Info("IP virtual connection established", slog.Any("local", local), slog.Any("remote", remote))
 	return conn, nil
@@ -383,29 +402,21 @@ func makeMulticastIPv4Conn(multi, local net.IP) (*net.IPConn, error) {
 	if errOfListenIP != nil {
 		return nil, fmt.Errorf("makeMulticastIPv4Conn: %v", errOfListenIP)
 	}
-	var fd, errOfGetFD = conn.File()
-	if errOfGetFD != nil {
-		return nil, fmt.Errorf("makeMulticastIPv4Conn: %v", errOfGetFD)
-	}
-	defer fd.Close()
 	multi = multi.To4()
 	local = local.To4()
 	var mreq = &syscall.IPMreq{
 		Multiaddr: [4]byte{multi[0], multi[1], multi[2], multi[3]},
 		Interface: [4]byte{local[0], local[1], local[2], local[3]},
 	}
-	if errSetMreq := syscall.SetsockoptIPMreq(int(fd.Fd()), syscall.IPPROTO_IP, syscall.IP_ADD_MEMBERSHIP, mreq); errSetMreq != nil {
+	if errSetMreq := controlIPConn(conn, func(fd uintptr) error {
+		return syscall.SetsockoptIPMreq(int(fd), syscall.IPPROTO_IP, syscall.IP_ADD_MEMBERSHIP, mreq)
+	}); errSetMreq != nil {
 		return nil, fmt.Errorf("makeMulticastIPv4Conn: %v", errSetMreq)
 	}
 	return conn, nil
 }
 
 func joinIPv6MulticastGroup(con *net.IPConn, local, remote net.IP) error {
-	var fd, errOfGetFD = con.File()
-	if errOfGetFD != nil {
-		return fmt.Errorf("joinIPv6MulticastGroup: %v", errOfGetFD)
-	}
-	defer fd.Close()
 	var mreq = &syscall.IPv6Mreq{}
 	copy(mreq.Multiaddr[:], remote.To16())
 	var IF, errOfGetIF = findInterfacebyIP(local)
@@ -413,7 +424,9 @@ func joinIPv6MulticastGroup(con *net.IPConn, local, remote net.IP) error {
 		return fmt.Errorf("joinIPv6MulticastGroup: %v", errOfGetIF)
 	}
 	mreq.Interface = uint32(IF.Index)
-	if errOfSetMreq := syscall.SetsockoptIPv6Mreq(int(fd.Fd()), syscall.IPPROTO_IPV6, syscall.IPV6_JOIN_GROUP, mreq); errOfSetMreq != nil {
+	if errOfSetMreq := controlIPConn(con, func(fd uintptr) error {
+		return syscall.SetsockoptIPv6Mreq(int(fd), syscall.IPPROTO_IPV6, syscall.IPV6_JOIN_GROUP, mreq)
+	}); errOfSetMreq != nil {
 		return fmt.Errorf("joinIPv6MulticastGroup: %v", errOfSetMreq)
 	}
 	getLogger().Info("joined IPv6 multicast group", slog.Any("group", remote), slog.String("interface", IF.Name))

@@ -32,6 +32,19 @@ type recordingIPConnection struct {
 	writes int
 }
 
+type blockingIPConnection struct {
+	mockIPConnection
+	closeStarted chan struct{}
+	unblockClose chan struct{}
+}
+
+type blockingRecordingIPConnection struct {
+	mockIPConnection
+	closeStarted chan struct{}
+	unblockClose chan struct{}
+	writes       int
+}
+
 func newBackupRouterForPreemptDelayTests(masterAdvertTicks uint16) *VirtualRouter {
 	vr := &VirtualRouter{
 		priority:              100,
@@ -202,6 +215,38 @@ func (m *recordingIPConnection) writeCount() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.writes
+}
+
+func (m *blockingIPConnection) Close() error {
+	close(m.closeStarted)
+	<-m.unblockClose
+	return m.mockIPConnection.Close()
+}
+
+func (m *blockingRecordingIPConnection) WriteMessage(_ *VRRPPacket) error {
+	m.mu.Lock()
+	m.writes++
+	m.mu.Unlock()
+	return nil
+}
+
+func (m *blockingRecordingIPConnection) WriteMessageTo(_ *VRRPPacket, _ net.IP) error {
+	m.mu.Lock()
+	m.writes++
+	m.mu.Unlock()
+	return nil
+}
+
+func (m *blockingRecordingIPConnection) writeCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.writes
+}
+
+func (m *blockingRecordingIPConnection) Close() error {
+	close(m.closeStarted)
+	<-m.unblockClose
+	return m.mockIPConnection.Close()
 }
 
 func TestAssembleVRRPPacketForDestinationRecomputesChecksumPerPeer(t *testing.T) {
@@ -752,6 +797,155 @@ func TestStopIsIdempotentAndBlocksUntilExit(t *testing.T) {
 	case <-done:
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("Stop did not return after eventSelector exited")
+	}
+}
+
+func TestStopBlocksUntilShutdownResourcesUnblock(t *testing.T) {
+	conn := &blockingIPConnection{
+		closeStarted: make(chan struct{}),
+		unblockClose: make(chan struct{}),
+	}
+	timer := time.NewTimer(time.Minute)
+	defer timer.Stop()
+
+	vr := &VirtualRouter{
+		state:             BACKUP,
+		eventChannel:      make(chan EVENT, 1),
+		packetQueue:       make(chan *VRRPPacket, 1),
+		stopSignal:        make(chan struct{}),
+		done:              make(chan struct{}),
+		transitionHandler: make(map[transition]func(int)),
+		ipAddrAnnouncer:   &mockAddrAnnouncer{},
+		iplayerInterface:  conn,
+		masterDownTimer:   timer,
+	}
+
+	go vr.eventSelector()
+
+	stopped := make(chan struct{})
+	go func() {
+		vr.Stop()
+		close(stopped)
+	}()
+
+	select {
+	case <-conn.closeStarted:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("shutdown path did not reach IP connection close")
+	}
+
+	select {
+	case <-stopped:
+		t.Fatal("Stop returned before shutdown resources finished")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(conn.unblockClose)
+
+	select {
+	case <-stopped:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("Stop did not return after shutdown resources were unblocked")
+	}
+}
+
+func TestStopBlocksWhenCloseIPConnectionHangsInMasterShutdown(t *testing.T) {
+	conn := &blockingRecordingIPConnection{
+		closeStarted: make(chan struct{}),
+		unblockClose: make(chan struct{}),
+	}
+	announcer := &mockAddrAnnouncer{}
+	advertTicker := time.NewTicker(time.Hour)
+	defer advertTicker.Stop()
+	garpTimer := time.NewTimer(time.Hour)
+	defer garpTimer.Stop()
+
+	vr := &VirtualRouter{
+		state:                 MASTER,
+		priority:              100,
+		advertisementInterval: 100,
+		ipvX:                  IPv4,
+		preferredSourceIP:     net.IPv4(192, 0, 2, 10).To16(),
+		protectedIPaddrs:      make(map[[16]byte]*net.Interface),
+		eventChannel:          make(chan EVENT, 1),
+		packetQueue:           make(chan *VRRPPacket, 1),
+		stopSignal:            make(chan struct{}),
+		done:                  make(chan struct{}),
+		transitionHandler:     make(map[transition]func(int)),
+		ipAddrAnnouncer:       announcer,
+		iplayerInterface:      conn,
+		advertisementTicker:   advertTicker,
+		gratuitousArpTimer:    garpTimer,
+	}
+
+	go vr.eventSelector()
+
+	stopped := make(chan struct{})
+	go func() {
+		vr.Stop()
+		close(stopped)
+	}()
+
+	select {
+	case <-conn.closeStarted:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("master shutdown did not reach IP connection close")
+	}
+
+	if conn.writeCount() == 0 {
+		t.Fatal("expected master shutdown to send priority-0 advertisement before closing IP connection")
+	}
+	if !announcer.isClosed() {
+		t.Fatal("expected announcer to close before IP connection close completed")
+	}
+
+	select {
+	case <-stopped:
+		t.Fatal("Stop returned before blocked IP connection close completed")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(conn.unblockClose)
+
+	select {
+	case <-stopped:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("Stop did not return after blocked IP connection close was released")
+	}
+}
+
+func TestStopReturnsAfterDeferredShutdownSendWhenEventChannelStartsFull(t *testing.T) {
+	vr := &VirtualRouter{
+		state:             INIT,
+		eventChannel:      make(chan EVENT, 1),
+		packetQueue:       make(chan *VRRPPacket, 1),
+		stopSignal:        make(chan struct{}),
+		done:              make(chan struct{}),
+		transitionHandler: make(map[transition]func(int)),
+		ipAddrAnnouncer:   &mockAddrAnnouncer{},
+		iplayerInterface:  &mockIPConnection{},
+	}
+
+	vr.eventChannel <- HEARTBEAT_DOWN
+
+	stopped := make(chan struct{})
+	go func() {
+		vr.Stop()
+		close(stopped)
+	}()
+
+	select {
+	case <-stopped:
+		t.Fatal("Stop returned before event loop started consuming events")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	go vr.eventSelector()
+
+	select {
+	case <-stopped:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("Stop did not return after event loop drained the full event channel")
 	}
 }
 
