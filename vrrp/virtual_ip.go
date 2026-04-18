@@ -144,7 +144,7 @@ func (r *VirtualRouter) activateManagedVIPs() error {
 			errs = append(errs, fmt.Errorf("activate %v: parse %s: %v", net.IP(key[:]), vip.cidr, err))
 			continue
 		}
-		addr.Flags |= ifaFNoprefixroute
+		//addr.Flags |= ifaFNoprefixroute
 		if err := r.netlinkOps.AddrAdd(link, addr); err != nil && !ignoreAddrAddError(err) {
 			errs = append(errs, fmt.Errorf("activate %v on %s: %v", net.IP(key[:]), vip.announceIface, err))
 		}
